@@ -119,7 +119,7 @@ pub struct BinauralState {
 
 impl BinauralState {
     pub fn new(sample_rate: u32) -> Self {
-        let sr = sample_rate.max(1) as f32;
+        let sr = sample_rate.clamp(1, 768_000) as f32;
         let max_delay = (MAX_ITD_SECS * sr).ceil() as usize + 2;
         BinauralState {
             sample_rate: sr,
@@ -201,8 +201,21 @@ impl BinauralState {
         left: &mut [f32],
         right: &mut [f32],
     ) {
-        let az = wrap_pi(azimuth);
-        self.retune(az, elevation);
+        let frames = mono.len().min(left.len()).min(right.len());
+        if frames == 0 {
+            return;
+        }
+        let az = if azimuth.is_finite() {
+            wrap_pi(azimuth)
+        } else {
+            0.0
+        };
+        let el = if elevation.is_finite() {
+            elevation.clamp(-PI / 2.0, PI / 2.0)
+        } else {
+            0.0
+        };
+        self.retune(az, el);
         let s = az.sin();
         let side = s.abs().min(1.0);
         // Woodworth-ish split: the far ear waits, and hears less highs.
@@ -218,7 +231,8 @@ impl BinauralState {
         let g_far = 1.0 - 0.55 * side.powf(1.5);
         let (gl, gr) = if s >= 0.0 { (g_far, 1.0) } else { (1.0, g_far) };
         let n = self.delay_l.len();
-        for (k, &x) in mono.iter().enumerate() {
+        for (k, &raw_x) in mono[..frames].iter().enumerate() {
+            let x = if raw_x.is_finite() { raw_x } else { 0.0 };
             let p = self.pos;
             self.delay_l[p] = x;
             self.delay_r[p] = x;
@@ -375,5 +389,26 @@ mod tests {
         assert_eq!(l1, l2);
         assert_eq!(r1, r2);
         assert!(l1.iter().chain(&r1).all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn handles_mismatched_buffers_and_nonfinite_inputs() {
+        let mut st = BinauralState::new(48_000);
+        let mut l = vec![0.0; 16];
+        let mut r = vec![0.0; 4];
+        st.process_into(&[0.1; 16], 0.5, 0.2, &mut l, &mut r);
+
+        let mut st2 = BinauralState::new(48_000);
+        let mut l2 = vec![0.0; 8];
+        let mut r2 = vec![0.0; 8];
+        st2.process_into(
+            &[f32::NAN, 0.2, 0.3],
+            f32::NAN,
+            f32::INFINITY,
+            &mut l2[..3],
+            &mut r2[..3],
+        );
+        st2.process_into(&[0.5; 8], 0.1, 0.0, &mut l2, &mut r2);
+        assert!(l2.iter().chain(&r2).all(|x| x.is_finite()));
     }
 }

@@ -274,18 +274,26 @@ pub fn envelope(samples: &[f32], channels: u16, columns: usize) -> Vec<(f32, f32
     }
     (0..columns)
         .map(|c| {
-            let a = c * frames / columns;
-            let b = ((c + 1) * frames / columns).max(a + 1).min(frames);
+            let a = (c as u128 * frames as u128 / columns as u128) as usize;
+            let b = ((c as u128 + 1) * frames as u128 / columns as u128)
+                .max(a as u128 + 1)
+                .min(frames as u128) as usize;
             let mut lo = f32::INFINITY;
             let mut hi = f32::NEG_INFINITY;
             for f in a..b {
                 for k in 0..ch {
                     let x = samples[f * ch + k];
-                    lo = lo.min(x);
-                    hi = hi.max(x);
+                    if x.is_finite() {
+                        lo = lo.min(x);
+                        hi = hi.max(x);
+                    }
                 }
             }
-            (lo, hi)
+            if lo <= hi {
+                (lo, hi)
+            } else {
+                (0.0, 0.0)
+            }
         })
         .collect()
 }
@@ -314,8 +322,13 @@ pub fn engagement_from_series(
     let mut sum_gr = 0.0f64;
     let mut prev_t = 0.0f64;
     for &(t, gr) in &series {
-        let dt = (t - prev_t).max(0.0);
-        prev_t = t;
+        let dt = if t.is_finite() {
+            let d = (t - prev_t).max(0.0);
+            prev_t = t;
+            d
+        } else {
+            0.0
+        };
         let gr = if gr.is_finite() { gr.max(0.0) } else { 0.0 };
         if gr >= ENGAGE_THRESHOLD_DB {
             engaged += 1;
@@ -507,7 +520,7 @@ fn evaluate_ducking(
     if !tel.sidechain_configured && tel.ducks.is_empty() && tel.cue_rms_db.is_empty() {
         return None;
     }
-    let w_secs = if tel.window_secs > 0.0 {
+    let w_secs = if tel.window_secs.is_finite() && tel.window_secs > 0.0 {
         tel.window_secs
     } else {
         0.1
@@ -564,7 +577,11 @@ fn evaluate_ducking(
             if !is_active {
                 continue;
             }
-            let dr = raw_drop.max(0.0);
+            let dr = if raw_drop.is_finite() {
+                raw_drop.max(0.0)
+            } else {
+                0.0
+            };
             drop_sum += dr;
             drop_cnt += 1;
             if let (Some(&cue), Some(&bed)) = (tel.cue_rms_db.get(w), d.bed_rms_db.get(w)) {
@@ -1001,5 +1018,39 @@ mod tests {
         assert_eq!(e.len(), 48);
         assert!(e.iter().all(|(lo, hi)| *lo >= -0.51 && *hi <= 0.51));
         assert!(e.iter().any(|(lo, hi)| hi - lo > 0.9));
+    }
+
+    #[test]
+    fn handles_nonfinite_envelope_and_telemetry() {
+        let e = envelope(&[f32::NAN; 8], 1, 2);
+        assert!(e
+            .iter()
+            .all(|(lo, hi)| lo.is_finite() && hi.is_finite() && lo <= hi));
+
+        let eng = engagement_from_series(
+            vec![(0.5, 12.0), (f64::NAN, 0.0), (0.8, 0.0), (1.0, 12.0)],
+            EngagementSource::Telemetry,
+            Some(true),
+        );
+        assert_eq!(eng.engagements, 2);
+
+        let audio = sine(0.1, 2.0);
+        let tel = MixTelemetry {
+            window_secs: f64::NAN,
+            sidechain_configured: true,
+            cue_rms_db: vec![-12.0, -12.0, -40.0],
+            ducks: vec![BusDuckTelemetry {
+                bus: "bed".into(),
+                amount_db: 12.0,
+                hold_ms: 80.0,
+                release_ms: 250.0,
+                drop_db: vec![0.0, f64::INFINITY, 0.0],
+                bed_rms_db: vec![-24.0, -24.0, -24.0],
+            }],
+            ..Default::default()
+        };
+        let r = check_with_telemetry(&audio, 2, SR, &PlaythroughLimits::default(), Some(&tel));
+        let d = &r.ducking.unwrap().buses[0];
+        assert!(d.mean_drop_under_cue_db.is_finite());
     }
 }

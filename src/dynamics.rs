@@ -353,13 +353,27 @@ impl Limiter {
     pub fn set_sample_rate(&mut self, sample_rate: u32) {
         let sr = sample_rate.clamp(1, MAX_RATE);
         self.sample_rate = sr;
-        self.ceiling = db_to_lin(self.spec.ceiling_dbtp.min(0.0));
-        self.target = db_to_lin(self.spec.ceiling_dbtp.min(0.0) - LIMITER_MARGIN_DB);
-        let ms = self.spec.lookahead_ms.clamp(0.0, MAX_LOOKAHEAD_MS) as f64;
+        let ceil = if self.spec.ceiling_dbtp.is_finite() {
+            self.spec.ceiling_dbtp.min(0.0)
+        } else {
+            -1.0
+        };
+        self.ceiling = db_to_lin(ceil);
+        self.target = db_to_lin(ceil - LIMITER_MARGIN_DB);
+        let ms = if self.spec.lookahead_ms.is_finite() {
+            self.spec.lookahead_ms.clamp(0.0, MAX_LOOKAHEAD_MS) as f64
+        } else {
+            0.0
+        };
         self.look = ((ms * 1e-3 * sr as f64).round() as usize).clamp(1, self.boxbuf.len());
         self.win = self.look + TP_SPAN;
         self.dlen = self.look + TP_SPAN;
-        let rel = (self.spec.release_ms.max(1.0) as f64 * 1e-3 * sr as f64).max(1.0);
+        let rel_ms = if self.spec.release_ms.is_finite() {
+            self.spec.release_ms.max(1.0)
+        } else {
+            50.0
+        };
+        let rel = (rel_ms as f64 * 1e-3 * sr as f64).max(1.0);
         self.rel_coef = (1.0 - (-1.0 / rel).exp()) as f32;
         self.in_coef = (1.0 - (-1.0 / (0.02 * sr as f64)).exp()) as f32;
         self.reset();
@@ -406,7 +420,10 @@ impl Limiter {
     #[inline]
     pub fn process_frame(&mut self, l: f32, r: f32) -> (f32, f32) {
         self.in_gain += (self.in_target - self.in_gain) * self.in_coef;
-        let (l, r) = (l * self.in_gain, r * self.in_gain);
+        let l = if l.is_finite() { l * self.in_gain } else { 0.0 };
+        let r = if r.is_finite() { r * self.in_gain } else { 0.0 };
+        let l = if l.is_finite() { l } else { 0.0 };
+        let r = if r.is_finite() { r } else { 0.0 };
         // Interpolator history (newest first).
         self.hl.copy_within(0..TP_TAPS - 1, 1);
         self.hr.copy_within(0..TP_TAPS - 1, 1);
@@ -503,8 +520,13 @@ impl KeyDetector {
     /// Feed one key frame; returns the level in dBFS.
     #[inline]
     pub fn push(&mut self, l: f32, r: f32) -> f32 {
-        let p = 0.5 * (l * l + r * r);
+        let lf = if l.is_finite() { l as f64 } else { 0.0 };
+        let rf = if r.is_finite() { r as f64 } else { 0.0 };
+        let p = (0.5 * (lf * lf + rf * rf)).min(f32::MAX as f64) as f32;
         self.power += (p - self.power) * self.coef;
+        if !self.power.is_finite() {
+            self.power = f32::MAX;
+        }
         self.level_db()
     }
 
@@ -556,7 +578,12 @@ impl Ducker {
     /// Advance one frame with the key level (dBFS); returns the bus gain.
     #[inline]
     pub fn step(&mut self, key_db: f32) -> f32 {
-        let target = (key_db - self.spec.threshold_db).clamp(0.0, self.spec.amount_db);
+        let key = if key_db.is_nan() {
+            f32::NEG_INFINITY
+        } else {
+            key_db
+        };
+        let target = (key - self.spec.threshold_db).clamp(0.0, self.spec.amount_db);
         if target >= self.gr {
             self.gr = (self.gr + self.att_step).min(target);
             self.hold = self.hold_frames;
@@ -669,5 +696,32 @@ mod tests {
         assert!(long > spec.amount_db - 0.01, "long key drop {long}");
         assert!(tick < spec.amount_db / 3.0, "tick drop {tick}");
         assert_eq!(long_end, 0.0, "recovered by the end");
+    }
+
+    #[test]
+    fn sanitizes_nonfinite_inputs_and_recovers() {
+        let spec = LimiterSpec {
+            lookahead_ms: f32::NAN,
+            ..Default::default()
+        };
+        let mut lim = Limiter::new(spec, 48_000);
+        let _ = lim.process_frame(f32::NAN, f32::INFINITY);
+        for _ in 0..(lim.latency() + 16) {
+            let (a, b) = lim.process_frame(0.1, 0.1);
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "limiter poisoned: ({a}, {b})"
+            );
+        }
+        assert!(lim.take_min_gain().is_finite());
+
+        let mut kd = KeyDetector::new(48_000);
+        assert!(kd.push(1e20, 1e20).is_finite());
+        assert!(kd.push(f32::NAN, 0.0).is_finite());
+        assert!(kd.push(0.1, 0.1).is_finite());
+
+        let mut d = Ducker::new(DuckSpec::default(), 48_000);
+        assert!(d.step(f32::NAN).is_finite());
+        assert!(d.step(-10.0).is_finite());
     }
 }

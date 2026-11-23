@@ -90,7 +90,11 @@ pub struct KWeighting {
 
 impl KWeighting {
     pub fn new(sample_rate: f64) -> Self {
-        let fs = sample_rate.max(1.0);
+        let fs = if sample_rate.is_finite() {
+            sample_rate.max(4_000.0)
+        } else {
+            48_000.0
+        };
         let (shelf, hp) = k_weighting(fs);
         Self {
             sample_rate: fs,
@@ -110,7 +114,8 @@ impl KWeighting {
 
     #[inline]
     pub fn process(&mut self, x: f64) -> f64 {
-        self.hp.run(self.shelf.run(x))
+        let clean = if x.is_finite() { x } else { 0.0 };
+        self.hp.run(self.shelf.run(clean))
     }
 
     #[inline]
@@ -202,7 +207,8 @@ pub fn true_peak(samples: &[f32], channels: u16) -> f32 {
     let mut peak = 0.0f32;
     for c in 0..ch {
         let mut hist = [0.0f32; TP_TAPS];
-        for (i, x) in samples.iter().skip(c).step_by(ch).copied().enumerate() {
+        for (i, raw) in samples.iter().skip(c).step_by(ch).copied().enumerate() {
+            let x = if raw.is_finite() { raw } else { 0.0 };
             hist.copy_within(0..TP_TAPS - 1, 1);
             hist[0] = x;
             peak = peak.max(x.abs());
@@ -250,7 +256,8 @@ fn k_pass(samples: &[f32], channels: u16, sample_rate: u32) -> KPass {
     for f in 0..frames {
         let mut frame_clipped = false;
         for (c, k) in filters.iter_mut().enumerate() {
-            let x = samples[f * ch + c];
+            let raw = samples[f * ch + c];
+            let x = if raw.is_finite() { raw } else { 0.0 };
             let a = x.abs();
             peak = peak.max(a);
             if a >= CLIP_LEVEL {
@@ -350,7 +357,7 @@ fn loudness_range(st_powers: &[f64]) -> f64 {
     let abs: Vec<f64> = st_powers
         .iter()
         .copied()
-        .filter(|&z| energy_to_lufs(z) >= ABSOLUTE_GATE_LUFS)
+        .filter(|&z| z.is_finite() && energy_to_lufs(z) >= ABSOLUTE_GATE_LUFS)
         .collect();
     if abs.len() < 2 {
         return 0.0;
@@ -566,5 +573,27 @@ mod tests {
         assert!((streaming - r.integrated_lufs).abs() < 0.05);
         kw.reset();
         assert_eq!(kw.process(0.0), 0.0);
+    }
+
+    #[test]
+    fn handles_extreme_sample_rates_and_nonfinite_inputs() {
+        let mut kw = KWeighting::new(0.0);
+        for _ in 0..100 {
+            let y = kw.process(1.0);
+            assert!(y.is_finite() && y.abs() < 10.0, "unstable k-weighting: {y}");
+        }
+
+        let mut samples = vec![0.1f32; 48_000 * 2];
+        samples[100] = f32::NAN;
+        samples[200] = f32::INFINITY;
+        let r = measure(&samples, 1, 48_000);
+        assert!(r.integrated_lufs.is_finite(), "{:?}", r);
+        assert!(r.sample_peak_dbfs.is_finite() && r.true_peak_dbtp.is_finite());
+        assert!(short_term_series(&samples, 1, 48_000)
+            .iter()
+            .all(|(_, l)| l.is_finite()));
+
+        let lra = loudness_range(&[1.0, 2.0, 10.0, f64::NAN, f64::INFINITY]);
+        assert!(lra.is_finite() && lra > 0.0, "got lra={lra}");
     }
 }

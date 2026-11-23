@@ -160,6 +160,37 @@ impl Default for Bus {
     }
 }
 
+#[inline]
+fn sample_voice_frame(data: &[f32], pos: f64, is_loop: bool, src_len: usize) -> Option<f32> {
+    if !pos.is_finite() || pos < 0.0 || data.is_empty() {
+        return None;
+    }
+    if is_loop {
+        if src_len == 0 {
+            return None;
+        }
+        let wrapped = if pos >= (usize::MAX / 2) as f64 {
+            pos % src_len as f64
+        } else {
+            pos
+        };
+        let idx = (wrapped.floor() as usize) % src_len;
+        let frac = (wrapped - wrapped.floor()) as f32;
+        let s0 = data[idx];
+        let s1 = data[(idx + 1) % src_len];
+        Some(s0 + (s1 - s0) * frac)
+    } else {
+        if pos >= data.len() as f64 {
+            return None;
+        }
+        let idx = pos.floor() as usize;
+        let frac = (pos - idx as f64) as f32;
+        let s0 = data[idx];
+        let s1 = data.get(idx + 1).copied().unwrap_or(0.0);
+        Some(s0 + (s1 - s0) * frac)
+    }
+}
+
 pub struct Mixer {
     voices: [Voice; MAX_VOICES],
     buses: [Bus; MAX_BUSES],
@@ -683,30 +714,17 @@ impl Mixer {
                 let inv_n = 1.0 / n as f32;
                 let scratch = &mut self.scratch[..n];
                 for (i, slot) in scratch.iter_mut().enumerate() {
-                    let f = start_frame + i as u64;
+                    let f = start_frame.saturating_add(i as u64);
                     if f < v.start || f >= end {
                         *slot = 0.0;
                         continue;
                     }
                     let pos = (f - v.start) as f64 * rate;
-                    let idx = pos.floor() as usize;
-                    let frac = (pos - idx as f64) as f32;
-                    let s0 = if is_loop {
-                        v.data[idx % src_len as usize]
-                    } else if idx < v.data.len() {
-                        v.data[idx]
-                    } else {
+                    let Some(mut src) = sample_voice_frame(&v.data, pos, is_loop, src_len as usize)
+                    else {
                         *slot = 0.0;
                         continue;
                     };
-                    let s1 = if is_loop {
-                        v.data[(idx + 1) % src_len as usize]
-                    } else if idx + 1 < v.data.len() {
-                        v.data[idx + 1]
-                    } else {
-                        0.0
-                    };
-                    let mut src = s0 + (s1 - s0) * frac;
                     if filt {
                         v.lp_state += v.lowpass * (src - v.lp_state);
                         src = v.lp_state;
@@ -732,7 +750,7 @@ impl Mixer {
                         }
                     }
                 }
-                if end != u64::MAX && start_frame + n as u64 >= end {
+                if end != u64::MAX && start_frame.saturating_add(n as u64) >= end {
                     v.active = false;
                 }
                 continue;
@@ -753,28 +771,15 @@ impl Mixer {
                 let sbus = v.send_bus.max(0) as usize;
                 let cg = bus_chain_gains[bus];
                 for i in 0..n {
-                    let f = start_frame + i as u64;
+                    let f = start_frame.saturating_add(i as u64);
                     if f < v.start || f >= end {
                         continue;
                     }
                     let pos = (f - v.start) as f64 * rate;
-                    let idx = pos.floor() as usize;
-                    let frac = (pos - idx as f64) as f32;
-                    let s0 = if is_loop {
-                        v.data[idx % src_len as usize]
-                    } else if idx < v.data.len() {
-                        v.data[idx]
-                    } else {
+                    let Some(mut src) = sample_voice_frame(&v.data, pos, is_loop, src_len as usize)
+                    else {
                         continue;
                     };
-                    let s1 = if is_loop {
-                        v.data[(idx + 1) % src_len as usize]
-                    } else if idx + 1 < v.data.len() {
-                        v.data[idx + 1]
-                    } else {
-                        0.0
-                    };
-                    let mut src = s0 + (s1 - s0) * frac;
                     if filt {
                         v.lp_state += v.lowpass * (src - v.lp_state);
                         src = v.lp_state;
@@ -808,38 +813,24 @@ impl Mixer {
                 v.gain = v.target_gain;
                 v.pan = v.target_pan;
                 v.send_gain = v.target_send;
-                if end != u64::MAX && start_frame + n as u64 >= end {
+                if end != u64::MAX && start_frame.saturating_add(n as u64) >= end {
                     v.active = false;
                 }
                 continue;
             }
             for i in 0..n {
-                let f = start_frame + i as u64;
+                let f = start_frame.saturating_add(i as u64);
                 if f < v.start || f >= end {
                     continue;
                 }
                 let pos = (f - v.start) as f64 * rate;
-                let idx = pos.floor() as usize;
-                let frac = (pos - idx as f64) as f32;
-                let s0 = if is_loop {
-                    v.data[idx % src_len as usize]
-                } else if idx < v.data.len() {
-                    v.data[idx]
-                } else {
+                let Some(src) = sample_voice_frame(&v.data, pos, is_loop, src_len as usize) else {
                     continue;
                 };
-                let s1 = if is_loop {
-                    v.data[(idx + 1) % src_len as usize]
-                } else if idx + 1 < v.data.len() {
-                    v.data[idx + 1]
-                } else {
-                    0.0
-                };
-                let src = s0 + (s1 - s0) * frac;
                 self.acc_l[bus][i] += src * gl;
                 self.acc_r[bus][i] += src * gr;
             }
-            if end != u64::MAX && start_frame + n as u64 >= end {
+            if end != u64::MAX && start_frame.saturating_add(n as u64) >= end {
                 v.active = false;
             }
         }
@@ -1218,5 +1209,42 @@ mod tests {
             m.start_voice(mono(64, 0.1), &VoiceParams::default()),
             Err(AfError::NoFreeVoice)
         ));
+    }
+
+    #[test]
+    fn render_block_handles_max_frame_and_loop_position_without_overflow() {
+        let mut m = Mixer::new();
+        m.start_voice(
+            mono(8, 0.25),
+            &VoiceParams {
+                loop_frames: Some(4),
+                start_frame: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.start_voice(
+            mono(8, 0.25),
+            &VoiceParams {
+                loop_frames: Some(4),
+                start_frame: 0,
+                lowpass: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.start_voice(
+            mono(8, 0.25),
+            &VoiceParams {
+                loop_frames: Some(4),
+                start_frame: 0,
+                binaural: Some((0.2, 0.0)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (mut l, mut r) = (vec![0.0; 8], vec![0.0; 8]);
+        m.render_block(&mut l, &mut r, u64::MAX - 2);
+        assert!(l.iter().chain(&r).all(|v| v.is_finite()));
     }
 }

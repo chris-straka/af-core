@@ -45,7 +45,8 @@ impl Vec3 {
     }
 
     pub fn length(self) -> f32 {
-        self.dot(self).sqrt()
+        let (x, y, z) = (self.x as f64, self.y as f64, self.z as f64);
+        (x * x + y * y + z * z).sqrt() as f32
     }
 
     /// Component-wise linear interpolation, `t` in [0, 1].
@@ -297,7 +298,7 @@ pub fn place_emitter(
     let rx = c * d.x - s * d.z;
     let rz = s * d.x + c * d.z;
     let ry = d.y;
-    let horizontal = (rx * rx + rz * rz).sqrt();
+    let horizontal = (rx as f64).hypot(rz as f64) as f32;
     let (pan, azimuth, elevation) = if distance <= 1e-6 {
         (0.0, 0.0, 0.0)
     } else {
@@ -468,5 +469,21 @@ mod tests {
         .unwrap();
         assert_eq!(p.gain, 1.0);
         assert!(p.lowpass < 1.0);
+    }
+
+    #[test]
+    fn large_finite_coordinates_do_not_overflow_distance() {
+        let a = att(AttenuationCurve::Inverse);
+        let p = place_emitter(
+            Vec3::new(1e20, 0.0, 1e20),
+            Listener::default(),
+            &a,
+            Occlusion::default(),
+            0.1,
+            48_000,
+        )
+        .unwrap();
+        assert!(p.distance.is_finite());
+        assert!(p.pan.is_finite() && p.azimuth.is_finite() && p.elevation.is_finite());
     }
 }

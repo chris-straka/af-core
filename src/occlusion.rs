@@ -51,21 +51,19 @@ fn jitter(i: usize) -> (f32, f32) {
 }
 
 /// Segment `o + d*s`, s in [0, 1], vs an AABB. Starting inside counts.
-fn ray_hits_box(o: Vec3, d: Vec3, b: &Aabb) -> bool {
-    let (mut tmin, mut tmax) = (0.0f32, 1.0f32);
-    let oo = [o.x, o.y, o.z];
-    let dd = [d.x, d.y, d.z];
-    let mn = [b.min.x, b.min.y, b.min.z];
-    let mx = [b.max.x, b.max.y, b.max.z];
+fn ray_hits_box(o: [f64; 3], d: [f64; 3], eps: f64, b: &Aabb) -> bool {
+    let (mut tmin, mut tmax) = (0.0f64, 1.0f64);
+    let mn = [b.min.x as f64, b.min.y as f64, b.min.z as f64];
+    let mx = [b.max.x as f64, b.max.y as f64, b.max.z as f64];
     for a in 0..3 {
-        if dd[a].abs() < 1e-12 {
-            if oo[a] < mn[a] || oo[a] > mx[a] {
+        if d[a].abs() < 1e-12 {
+            if o[a] < mn[a] || o[a] > mx[a] {
                 return false;
             }
         } else {
-            let inv = 1.0 / dd[a];
-            let mut t0 = (mn[a] - oo[a]) * inv;
-            let mut t1 = (mx[a] - oo[a]) * inv;
+            let inv = 1.0 / d[a];
+            let mut t0 = (mn[a] - o[a]) * inv;
+            let mut t1 = (mx[a] - o[a]) * inv;
             if t0 > t1 {
                 std::mem::swap(&mut t0, &mut t1);
             }
@@ -76,31 +74,54 @@ fn ray_hits_box(o: Vec3, d: Vec3, b: &Aabb) -> bool {
             }
         }
     }
-    tmax >= SEG_EPS && tmin <= 1.0 - SEG_EPS
+    tmax >= eps && tmin <= 1.0 - eps
+}
+
+#[inline]
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[inline]
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+#[inline]
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 /// Moller-Trumbore, segment parameterized on [0, 1].
-fn ray_hits_tri(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> bool {
-    let e1 = t[1] - t[0];
-    let e2 = t[2] - t[0];
-    let p = d.cross(e2);
-    let det = e1.dot(p);
+fn ray_hits_tri(o: [f64; 3], d: [f64; 3], eps: f64, tri: &[Vec3; 3]) -> bool {
+    let t0 = [tri[0].x as f64, tri[0].y as f64, tri[0].z as f64];
+    let t1 = [tri[1].x as f64, tri[1].y as f64, tri[1].z as f64];
+    let t2 = [tri[2].x as f64, tri[2].y as f64, tri[2].z as f64];
+    let e1 = sub3(t1, t0);
+    let e2 = sub3(t2, t0);
+    let p = cross3(d, e2);
+    let det = dot3(e1, p);
     if det.abs() < 1e-12 {
         return false;
     }
     let inv = 1.0 / det;
-    let s = o - t[0];
-    let u = s.dot(p) * inv;
-    if !(-SEG_EPS..=1.0 + SEG_EPS).contains(&u) {
+    let s = sub3(o, t0);
+    let u = dot3(s, p) * inv;
+    let tri_eps = SEG_EPS as f64;
+    if !(-tri_eps..=1.0 + tri_eps).contains(&u) {
         return false;
     }
-    let q = s.cross(e1);
-    let v = d.dot(q) * inv;
-    if v < -SEG_EPS || u + v > 1.0 + SEG_EPS {
+    let q = cross3(s, e1);
+    let v = dot3(d, q) * inv;
+    if v < -tri_eps || u + v > 1.0 + tri_eps {
         return false;
     }
-    let seg = e2.dot(q) * inv;
-    (SEG_EPS..=1.0 - SEG_EPS).contains(&seg)
+    let seg = dot3(e2, q) * inv;
+    (eps..=1.0 - eps).contains(&seg)
 }
 
 impl OcclusionScene {
@@ -150,9 +171,12 @@ impl OcclusionScene {
     }
 
     fn segment_blocked(&self, from: Vec3, to: Vec3) -> bool {
-        let d = to - from;
-        self.boxes.iter().any(|b| ray_hits_box(from, d, b))
-            || self.tris.iter().any(|t| ray_hits_tri(from, d, t))
+        let o = [from.x as f64, from.y as f64, from.z as f64];
+        let d = [to.x as f64 - o[0], to.y as f64 - o[1], to.z as f64 - o[2]];
+        let dist = dot3(d, d).sqrt();
+        let eps = (SEG_EPS as f64 / dist.max(1.0)).min(SEG_EPS as f64);
+        self.boxes.iter().any(|b| ray_hits_box(o, d, eps, b))
+            || self.tris.iter().any(|t| ray_hits_tri(o, d, eps, t))
     }
 
     /// Fraction of [`OCCLUSION_RAYS`] listener->source segments blocked,
@@ -166,9 +190,11 @@ impl OcclusionScene {
                 "source_radius must be finite and >= 0, got {source_radius}"
             )));
         }
-        let axis = source - listener;
-        let dist = axis.length();
-        if dist <= 1e-9 || self.is_empty() {
+        let dx = source.x as f64 - listener.x as f64;
+        let dy = source.y as f64 - listener.y as f64;
+        let dz = source.z as f64 - listener.z as f64;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist <= 1e-9 || !dist.is_finite() || self.is_empty() {
             return Ok(0.0);
         }
         if source_radius == 0.0 {
@@ -178,7 +204,7 @@ impl OcclusionScene {
                 0.0
             });
         }
-        let w = axis.scale(1.0 / dist);
+        let w = Vec3::new((dx / dist) as f32, (dy / dist) as f32, (dz / dist) as f32);
         let mut u = w.cross(Vec3::new(0.0, 1.0, 0.0));
         if u.length() < 1e-6 {
             u = w.cross(Vec3::new(1.0, 0.0, 0.0));
@@ -277,5 +303,14 @@ mod tests {
         let parsed: OcclusionScene = serde_json::from_str(json).unwrap();
         assert!(parsed.validate().is_ok());
         assert!(serde_json::from_str::<OcclusionScene>(r#"{"walls":[]}"#).is_err());
+    }
+
+    #[test]
+    fn large_finite_distances_preserve_occlusion() {
+        let s = wall();
+        let occ = s
+            .occlusion01(Vec3::default(), Vec3::new(0.0, 0.0, -1e20), 0.5)
+            .unwrap();
+        assert_eq!(occ, 1.0);
     }
 }
