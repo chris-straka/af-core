@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! af-core: engine-agnostic runtime.
 //!
 //! Two paths share one contract:

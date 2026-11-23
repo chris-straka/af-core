@@ -27,7 +27,7 @@ impl SeededRng {
         let mut z = self.state;
         z = (z ^ (z >> 15)).wrapping_mul(z | 1);
         z ^= z.wrapping_add((z ^ (z >> 7)).wrapping_mul(z | 61));
-        self.draws += 1;
+        self.draws = self.draws.wrapping_add(1);
         z ^ (z >> 14)
     }
 
@@ -40,7 +40,17 @@ impl SeededRng {
 
     /// Next `f32` in [lo, hi].
     pub fn range_f32(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * self.next_f32()
+        let r = self.next_f32();
+        if !lo.is_finite() || !hi.is_finite() {
+            return 0.0;
+        }
+        let span = hi - lo;
+        if span.is_finite() {
+            lo + span * r
+        } else {
+            ((lo as f64) + ((hi as f64) - (lo as f64)) * (r as f64))
+                .clamp(-f32::MAX as f64, f32::MAX as f64) as f32
+        }
     }
 
     pub fn draws(&self) -> u64 {

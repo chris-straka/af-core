@@ -177,13 +177,21 @@ impl BandPass {
 
     #[inline]
     fn step(&mut self, x: f32) -> f32 {
-        let x = x as f64;
+        let x = if x.is_finite() { x as f64 } else { 0.0 };
         let y = self.b0 * (x - self.x2) - self.a1 * self.y1 - self.a2 * self.y2;
+        if !y.is_finite() {
+            self.x1 = 0.0;
+            self.x2 = 0.0;
+            self.y1 = 0.0;
+            self.y2 = 0.0;
+            return 0.0;
+        }
+        let y = if y.abs() < 1e-30 { 0.0 } else { y };
         self.x2 = self.x1;
         self.x1 = x;
         self.y2 = self.y1;
         self.y1 = y;
-        y as f32
+        y.clamp(-f32::MAX as f64, f32::MAX as f64) as f32
     }
 }
 
@@ -203,8 +211,9 @@ fn interp_f32(keys: &[(f32, f32)], t: f32) -> f32 {
             if dt <= 1e-9 {
                 return v1;
             }
-            let a = ((t - t0) / dt).clamp(0.0, 1.0);
-            return v0 + (v1 - v0) * a;
+            let a = (((t - t0) / dt).clamp(0.0, 1.0)) as f64;
+            return ((v0 as f64) + (v1 as f64 - v0 as f64) * a)
+                .clamp(-f32::MAX as f64, f32::MAX as f64) as f32;
         }
     }
     keys[last].1
@@ -262,9 +271,9 @@ fn normalize_fade_clamp(samples: &mut [f32], peak: f32, sample_rate: u32) {
     }
     let max_abs = samples.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     if max_abs > 0.0 {
-        let scale = peak / max_abs;
+        let scale = peak as f64 / max_abs as f64;
         for s in samples.iter_mut() {
-            *s *= scale;
+            *s = (*s as f64 * scale) as f32;
         }
     }
     let n = samples.len();
@@ -425,7 +434,8 @@ pub fn synthesize_voice(spec: &VoiceSpec, sample_rate: u32) -> Result<Vec<f32>> 
 
         let st = interp_f32(&pitch_keys, t);
         let vib = 0.012 * (std::f32::consts::TAU * 5.3 * t).sin();
-        let f = (f0 * (st / 12.0).exp2() * (1.0 + vib + drift)).max(20.0);
+        let semitone_scale = ((st as f64) / 12.0).clamp(-20.0, 20.0).exp2();
+        let f = ((f0 as f64) * semitone_scale * (1.0 + vib as f64 + drift as f64)).max(20.0) as f32;
 
         let top = ((5200.0 / f).min(sr_f * 0.45 / f) as usize).min(40);
         let mut src = 0.0f32;
@@ -449,7 +459,7 @@ pub fn synthesize_voice(spec: &VoiceSpec, sample_rate: u32) -> Result<Vec<f32>> 
 
         phase += std::f64::consts::TAU * (f as f64) / sr_f64;
         if phase >= std::f64::consts::TAU {
-            phase -= std::f64::consts::TAU * (phase / std::f64::consts::TAU).floor();
+            phase %= std::f64::consts::TAU;
         }
 
         let noise = rng.next_f32() * 2.0 - 1.0;
@@ -461,7 +471,7 @@ pub fn synthesize_voice(spec: &VoiceSpec, sample_rate: u32) -> Result<Vec<f32>> 
         sample += air.step(noise) * spec.breath * 0.7;
 
         let amp = interp_f32(&amp_keys, t);
-        out.push(sample * amp);
+        out.push(((sample as f64) * (amp as f64)).clamp(-f32::MAX as f64, f32::MAX as f64) as f32);
     }
 
     normalize_fade_clamp(&mut out, spec.peak, sample_rate);

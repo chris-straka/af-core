@@ -63,14 +63,17 @@ impl Comb {
 
     #[inline]
     fn process(&mut self, x: f32, feedback: f32, damp: f32) -> f32 {
-        let y = self.buf[self.pos];
-        self.store = y * (1.0 - damp) + self.store * damp;
-        self.buf[self.pos] = x + self.store * feedback;
+        let y = self.buf[self.pos] as f64;
+        let damp = damp as f64;
+        let store = y * (1.0 - damp) + (self.store as f64) * damp;
+        self.store = sanitize_f32(store);
+        let next = x as f64 + (self.store as f64) * (feedback as f64);
+        self.buf[self.pos] = sanitize_f32(next);
         self.pos += 1;
         if self.pos == self.buf.len() {
             self.pos = 0;
         }
-        y
+        y as f32
     }
 }
 
@@ -89,14 +92,24 @@ impl Allpass {
     }
 
     #[inline]
-    fn process(&mut self, x: f32) -> f32 {
-        let b = self.buf[self.pos];
-        self.buf[self.pos] = x + b * 0.5;
+    fn process(&mut self, x: f64) -> f64 {
+        let b = self.buf[self.pos] as f64;
+        let xf = if x.is_finite() { x } else { 0.0 };
+        self.buf[self.pos] = sanitize_f32(xf + b * 0.5);
         self.pos += 1;
         if self.pos == self.buf.len() {
             self.pos = 0;
         }
-        b - x
+        b - xf
+    }
+}
+
+#[inline]
+fn sanitize_f32(v: f64) -> f32 {
+    if !v.is_finite() || v.abs() < 1e-30 {
+        0.0
+    } else {
+        v.clamp(-f32::MAX as f64, f32::MAX as f64) as f32
     }
 }
 
@@ -147,21 +160,22 @@ impl Reverb {
         let n = l.len().min(r.len());
         let (fb, damp) = (self.feedback, self.damp);
         for i in 0..n {
-            let li = if l[i].is_finite() { l[i] } else { 0.0 };
-            let ri = if r[i].is_finite() { r[i] } else { 0.0 };
-            let x = (li + ri) * FIXED_GAIN;
+            let li = if l[i].is_finite() { l[i] as f64 } else { 0.0 };
+            let ri = if r[i].is_finite() { r[i] as f64 } else { 0.0 };
+            let x = ((li + ri) * FIXED_GAIN as f64) as f32;
             for ch in 0..2 {
-                let mut acc = 0.0f32;
+                let mut acc = 0.0f64;
                 for c in self.combs[ch].iter_mut() {
-                    acc += c.process(x, fb, damp);
+                    acc += c.process(x, fb, damp) as f64;
                 }
                 for a in self.allpasses[ch].iter_mut() {
                     acc = a.process(acc);
                 }
+                let out = sanitize_f32(acc);
                 if ch == 0 {
-                    l[i] = acc;
+                    l[i] = out;
                 } else {
-                    r[i] = acc;
+                    r[i] = out;
                 }
             }
         }

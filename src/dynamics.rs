@@ -244,15 +244,18 @@ pub const LIMITER_MARGIN_DB: f32 = 0.03;
 /// interpolated points around them (`hist[0]` newest).
 #[inline]
 pub fn interval_peak(hist: &[f32; TP_TAPS]) -> f32 {
-    let mut p = hist[TP_DELAY].abs().max(hist[TP_DELAY - 1].abs());
+    let clean = |v: f32| if v.is_finite() { v as f64 } else { 0.0 };
+    let mut p = clean(hist[TP_DELAY])
+        .abs()
+        .max(clean(hist[TP_DELAY - 1]).abs());
     for ph in &TRUE_PEAK_PHASES {
-        let mut y = 0.0f32;
-        for (c, h) in ph.iter().zip(hist.iter()) {
-            y += c * h;
+        let mut y = 0.0f64;
+        for (&c, &h) in ph.iter().zip(hist.iter()) {
+            y += (c as f64) * clean(h);
         }
         p = p.max(y.abs());
     }
-    p
+    p.min(f32::MAX as f64) as f32
 }
 
 fn db_to_lin(db: f32) -> f32 {
@@ -354,7 +357,7 @@ impl Limiter {
         let sr = sample_rate.clamp(1, MAX_RATE);
         self.sample_rate = sr;
         let ceil = if self.spec.ceiling_dbtp.is_finite() {
-            self.spec.ceiling_dbtp.min(0.0)
+            self.spec.ceiling_dbtp.clamp(-120.0, 0.0)
         } else {
             -1.0
         };
@@ -420,10 +423,16 @@ impl Limiter {
     #[inline]
     pub fn process_frame(&mut self, l: f32, r: f32) -> (f32, f32) {
         self.in_gain += (self.in_target - self.in_gain) * self.in_coef;
-        let l = if l.is_finite() { l * self.in_gain } else { 0.0 };
-        let r = if r.is_finite() { r * self.in_gain } else { 0.0 };
-        let l = if l.is_finite() { l } else { 0.0 };
-        let r = if r.is_finite() { r } else { 0.0 };
+        let l = if l.is_finite() {
+            (l as f64 * self.in_gain as f64).clamp(-f32::MAX as f64, f32::MAX as f64) as f32
+        } else {
+            0.0
+        };
+        let r = if r.is_finite() {
+            (r as f64 * self.in_gain as f64).clamp(-f32::MAX as f64, f32::MAX as f64) as f32
+        } else {
+            0.0
+        };
         // Interpolator history (newest first).
         self.hl.copy_within(0..TP_TAPS - 1, 1);
         self.hr.copy_within(0..TP_TAPS - 1, 1);
@@ -431,7 +440,7 @@ impl Limiter {
         self.hr[0] = r;
         let peak = interval_peak(&self.hl).max(interval_peak(&self.hr));
         let req = if peak > self.target {
-            self.target / peak
+            (self.target / peak).clamp(0.0, 1.0)
         } else {
             1.0
         };
@@ -458,7 +467,7 @@ impl Limiter {
         self.env = if hold < self.env {
             hold
         } else {
-            self.env + (hold - self.env) * self.rel_coef
+            (self.env + (hold - self.env) * self.rel_coef).clamp(0.0, 1.0)
         };
         // Moving average over the look-ahead.
         self.box_sum += self.env as f64 - self.boxbuf[self.box_pos] as f64;
@@ -466,8 +475,9 @@ impl Limiter {
         self.box_pos += 1;
         if self.box_pos == self.look {
             self.box_pos = 0;
+            self.box_sum = self.boxbuf[..self.look].iter().map(|&v| v as f64).sum();
         }
-        let g = ((self.box_sum / self.look as f64) as f32).min(1.0);
+        let g = ((self.box_sum / self.look as f64) as f32).clamp(0.0, 1.0);
         self.min_gain = self.min_gain.min(g);
         // Delay line.
         let (ol, or) = (self.dl[self.dpos], self.dr[self.dpos]);
@@ -526,6 +536,8 @@ impl KeyDetector {
         self.power += (p - self.power) * self.coef;
         if !self.power.is_finite() {
             self.power = f32::MAX;
+        } else if self.power < 1e-30 {
+            self.power = 0.0;
         }
         self.level_db()
     }
@@ -568,22 +580,56 @@ impl Ducker {
         self.spec
     }
 
+    fn sanitized_amount(&self) -> f32 {
+        if self.spec.amount_db.is_finite() {
+            self.spec.amount_db.max(0.0)
+        } else {
+            0.0
+        }
+    }
+
     pub fn set_sample_rate(&mut self, sample_rate: u32) {
         let fs = sample_rate.max(1) as f32 * 1e-3;
-        self.att_step = self.spec.amount_db / (self.spec.attack_ms * fs).max(1.0);
-        self.rel_step = self.spec.amount_db / (self.spec.release_ms * fs).max(1.0);
-        self.hold_frames = (self.spec.hold_ms * fs).round() as u32;
+        let amount = self.sanitized_amount();
+        let attack_ms = if self.spec.attack_ms.is_finite() {
+            self.spec.attack_ms.max(1e-3)
+        } else {
+            1.0
+        };
+        let release_ms = if self.spec.release_ms.is_finite() {
+            self.spec.release_ms.max(1e-3)
+        } else {
+            1.0
+        };
+        let hold_ms = if self.spec.hold_ms.is_finite() {
+            self.spec.hold_ms.max(0.0)
+        } else {
+            0.0
+        };
+        self.att_step = amount / (attack_ms * fs).max(1.0);
+        self.rel_step = amount / (release_ms * fs).max(1.0);
+        self.hold_frames = (hold_ms * fs).round() as u32;
     }
 
     /// Advance one frame with the key level (dBFS); returns the bus gain.
     #[inline]
     pub fn step(&mut self, key_db: f32) -> f32 {
+        let amount = self.sanitized_amount();
+        if amount <= 0.0 {
+            self.gr = 0.0;
+            return 1.0;
+        }
+        let threshold = if self.spec.threshold_db.is_finite() {
+            self.spec.threshold_db
+        } else {
+            0.0
+        };
         let key = if key_db.is_nan() {
             f32::NEG_INFINITY
         } else {
             key_db
         };
-        let target = (key - self.spec.threshold_db).clamp(0.0, self.spec.amount_db);
+        let target = (key - threshold).clamp(0.0, amount);
         if target >= self.gr {
             self.gr = (self.gr + self.att_step).min(target);
             self.hold = self.hold_frames;
@@ -592,6 +638,7 @@ impl Ducker {
         } else {
             self.gr = (self.gr - self.rel_step).max(target);
         }
+        self.gr = self.gr.clamp(0.0, amount);
         self.max_gr = self.max_gr.max(self.gr);
         if self.gr <= 0.0 {
             1.0

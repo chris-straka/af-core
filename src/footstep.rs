@@ -292,24 +292,32 @@ pub fn signal_stats(data: &[f32]) -> SignalStats {
     if data.is_empty() {
         return st;
     }
+    let clean = |v: f32| if v.is_finite() { v } else { 0.0 };
     let (mut sum_sq, mut sum_abs, mut sum_diff) = (0.0f64, 0.0f64, 0.0f64);
     let mut crossings = 0u64;
-    for (i, &v) in data.iter().enumerate() {
+    let mut prev = 0.0f32;
+    for (i, &raw) in data.iter().enumerate() {
+        let v = clean(raw);
         st.peak = st.peak.max(v.abs());
         sum_sq += v as f64 * v as f64;
         sum_abs += v.abs() as f64;
         if i > 0 {
-            let prev = data[i - 1];
             if (v >= 0.0) != (prev >= 0.0) {
                 crossings += 1;
             }
-            sum_diff += (v - prev).abs() as f64;
+            sum_diff += (v as f64 - prev as f64).abs();
         }
+        prev = v;
     }
     let n = data.len() as f64;
     st.rms = (sum_sq / n).sqrt() as f32;
     st.zero_cross_rate = (crossings as f64 / n) as f32;
-    st.brightness = ((sum_diff / (sum_abs + 1e-9)) * 0.25).clamp(0.0, 1.0) as f32;
+    let b = (sum_diff / (sum_abs + 1e-9)) * 0.25;
+    st.brightness = if b.is_finite() {
+        b.clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
     st
 }
 

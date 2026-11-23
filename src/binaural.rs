@@ -16,23 +16,25 @@ pub const SPEED_OF_SOUND_M_S: f32 = 343.0;
 pub const MAX_ITD_SECS: f32 = HEAD_RADIUS_M / SPEED_OF_SOUND_M_S * (PI / 2.0 + 1.0);
 
 /// Second-order IIR section (RBJ cookbook), direct form I.
+/// Internal state uses `f64` so extreme finite inputs cannot overflow into
+/// `Inf - Inf = NaN` wedges; subnormals are flushed to zero.
 #[derive(Debug, Clone, Copy)]
 struct Biquad {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-    x1: f32,
-    x2: f32,
-    y1: f32,
-    y2: f32,
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
 }
 
 impl Biquad {
-    fn new(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
-        let mut q = Biquad {
-            b0: 0.0,
+    fn new_zero() -> Self {
+        Self {
+            b0: 1.0,
             b1: 0.0,
             b2: 0.0,
             a1: 0.0,
@@ -41,60 +43,95 @@ impl Biquad {
             x2: 0.0,
             y1: 0.0,
             y2: 0.0,
-        };
-        q.set(b0, b1, b2, a0, a1, a2);
-        q
+        }
     }
+
     /// New coefficients, keeping the running state (no clicks on retune).
-    fn set(&mut self, b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) {
+    fn set(&mut self, b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) {
+        if !a0.is_finite() || a0.abs() < 1e-12 {
+            return;
+        }
         self.b0 = b0 / a0;
         self.b1 = b1 / a0;
         self.b2 = b2 / a0;
         self.a1 = a1 / a0;
         self.a2 = a2 / a0;
     }
-    fn lowpass(freq_hz: f32, q: f32, sample_rate: f32) -> Self {
-        let w0 = 2.0 * PI * (freq_hz / sample_rate).clamp(0.001, 0.49);
+
+    fn set_lowpass(&mut self, freq_hz: f32, q: f32, sample_rate: f32) {
+        let w0 = 2.0 * std::f64::consts::PI * ((freq_hz / sample_rate).clamp(0.001, 0.49) as f64);
         let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * q.max(0.05));
-        Biquad::new(
+        let alpha = sin / (2.0 * (q.max(0.05) as f64));
+        self.set(
             (1.0 - cos) / 2.0,
             1.0 - cos,
             (1.0 - cos) / 2.0,
             1.0 + alpha,
             -2.0 * cos,
             1.0 - alpha,
-        )
+        );
     }
-    fn notch(freq_hz: f32, q: f32, sample_rate: f32) -> Self {
-        let w0 = 2.0 * PI * (freq_hz / sample_rate).clamp(0.001, 0.49);
+
+    fn set_notch(&mut self, freq_hz: f32, q: f32, sample_rate: f32) {
+        let w0 = 2.0 * std::f64::consts::PI * ((freq_hz / sample_rate).clamp(0.001, 0.49) as f64);
         let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * q.max(0.05));
-        Biquad::new(1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha)
+        let alpha = sin / (2.0 * (q.max(0.05) as f64));
+        self.set(1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha);
     }
-    fn peaking(freq_hz: f32, q: f32, gain_db: f32, sample_rate: f32) -> Self {
-        let a = 10.0f32.powf(gain_db / 40.0);
-        let w0 = 2.0 * PI * (freq_hz / sample_rate).clamp(0.001, 0.49);
+
+    fn set_peaking(&mut self, freq_hz: f32, q: f32, gain_db: f32, sample_rate: f32) {
+        let a = 10.0f64.powf(gain_db as f64 / 40.0);
+        let w0 = 2.0 * std::f64::consts::PI * ((freq_hz / sample_rate).clamp(0.001, 0.49) as f64);
         let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * q.max(0.05));
-        Biquad::new(
+        let alpha = sin / (2.0 * (q.max(0.05) as f64));
+        self.set(
             1.0 + alpha * a,
             -2.0 * cos,
             1.0 - alpha * a,
             1.0 + alpha / a,
             -2.0 * cos,
             1.0 - alpha / a,
-        )
+        );
     }
+
+    fn lowpass(freq_hz: f32, q: f32, sample_rate: f32) -> Self {
+        let mut q_filt = Self::new_zero();
+        q_filt.set_lowpass(freq_hz, q, sample_rate);
+        q_filt
+    }
+
+    fn notch(freq_hz: f32, q: f32, sample_rate: f32) -> Self {
+        let mut q_filt = Self::new_zero();
+        q_filt.set_notch(freq_hz, q, sample_rate);
+        q_filt
+    }
+
+    fn peaking(freq_hz: f32, q: f32, gain_db: f32, sample_rate: f32) -> Self {
+        let mut q_filt = Self::new_zero();
+        q_filt.set_peaking(freq_hz, q, gain_db, sample_rate);
+        q_filt
+    }
+
     fn run(&mut self, x: f32) -> f32 {
-        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+        let x = if x.is_finite() { x as f64 } else { 0.0 };
+        let mut y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2;
+        if !y.is_finite() {
+            self.x1 = 0.0;
+            self.x2 = 0.0;
+            self.y1 = 0.0;
+            self.y2 = 0.0;
+            return 0.0;
+        }
+        if y.abs() < 1e-30 {
+            y = 0.0;
+        }
         self.x2 = self.x1;
         self.x1 = x;
         self.y2 = self.y1;
         self.y1 = y;
-        y
+        y.clamp(-f32::MAX as f64, f32::MAX as f64) as f32
     }
 }
 
@@ -139,52 +176,17 @@ impl BinauralState {
         }
     }
 
-    fn coefs_lowpass(freq_hz: f32, q: f32, sr: f32) -> (f32, f32, f32, f32, f32, f32) {
-        let w0 = 2.0 * PI * (freq_hz / sr).clamp(0.001, 0.49);
-        let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * q.max(0.05));
-        (
-            (1.0 - cos) / 2.0,
-            1.0 - cos,
-            (1.0 - cos) / 2.0,
-            1.0 + alpha,
-            -2.0 * cos,
-            1.0 - alpha,
-        )
-    }
-    fn coefs_notch(freq_hz: f32, q: f32, sr: f32) -> (f32, f32, f32, f32, f32, f32) {
-        let w0 = 2.0 * PI * (freq_hz / sr).clamp(0.001, 0.49);
-        let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * q.max(0.05));
-        (1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha)
-    }
-    fn coefs_peak(freq_hz: f32, q: f32, gain_db: f32, sr: f32) -> (f32, f32, f32, f32, f32, f32) {
-        let a = 10.0f32.powf(gain_db / 40.0);
-        let w0 = 2.0 * PI * (freq_hz / sr).clamp(0.001, 0.49);
-        let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * q.max(0.05));
-        (
-            1.0 + alpha * a,
-            -2.0 * cos,
-            1.0 - alpha * a,
-            1.0 + alpha / a,
-            -2.0 * cos,
-            1.0 - alpha / a,
-        )
-    }
-
     fn retune(&mut self, azimuth: f32, elevation: f32) {
         let el = elevation.clamp(-PI / 2.0, PI / 2.0);
         if (azimuth - self.last_az).abs() > 1e-4 || (el - self.last_el).abs() > 1e-4 {
-            let (b0, b1, b2, a0, a1, a2) =
-                Self::coefs_notch(6_000.0 + 3_000.0 * el.sin(), 1.8, self.sample_rate);
-            self.pinna_l.set(b0, b1, b2, a0, a1, a2);
-            self.pinna_r.set(b0, b1, b2, a0, a1, a2);
+            let notch_hz = 6_000.0 + 3_000.0 * el.sin();
+            self.pinna_l.set_notch(notch_hz, 1.8, self.sample_rate);
+            self.pinna_r.set_notch(notch_hz, 1.8, self.sample_rate);
             let rear = smoothstep(azimuth.abs(), PI / 2.0, PI);
-            let (b0, b1, b2, a0, a1, a2) =
-                Self::coefs_peak(2_800.0, 1.0, -3.5 * rear, self.sample_rate);
-            self.rear_l.set(b0, b1, b2, a0, a1, a2);
-            self.rear_r.set(b0, b1, b2, a0, a1, a2);
+            self.rear_l
+                .set_peaking(2_800.0, 1.0, -3.5 * rear, self.sample_rate);
+            self.rear_r
+                .set_peaking(2_800.0, 1.0, -3.5 * rear, self.sample_rate);
             self.last_az = azimuth;
             self.last_el = el;
         }
@@ -223,9 +225,8 @@ impl BinauralState {
         let itd_r = s.max(0.0) * MAX_ITD_SECS * self.sample_rate;
         let dark = 18_000.0_f32.lerp(900.0, side.powf(1.5)).max(120.0);
         if (dark - self.last_dark).abs() > 1.0 {
-            let (b0, b1, b2, a0, a1, a2) = Self::coefs_lowpass(dark, 0.7, self.sample_rate);
-            self.shadow_l.set(b0, b1, b2, a0, a1, a2);
-            self.shadow_r.set(b0, b1, b2, a0, a1, a2);
+            self.shadow_l.set_lowpass(dark, 0.7, self.sample_rate);
+            self.shadow_r.set_lowpass(dark, 0.7, self.sample_rate);
             self.last_dark = dark;
         }
         let g_far = 1.0 - 0.55 * side.powf(1.5);
@@ -241,10 +242,22 @@ impl BinauralState {
             let r = read_delay(&self.delay_r, self.pos, itd_r) * gr;
             let l = self.rear_l.run(self.pinna_l.run(self.shadow_l.run(l)));
             let r = self.rear_r.run(self.pinna_r.run(self.shadow_r.run(r)));
-            left[k] += l;
-            right[k] += r;
+            add_finite(&mut left[k], l);
+            add_finite(&mut right[k], r);
         }
     }
+}
+
+#[inline]
+fn add_finite(dst: &mut f32, delta: f32) {
+    let cur = if dst.is_finite() { *dst } else { 0.0 };
+    let d = if delta.is_finite() { delta } else { 0.0 };
+    let sum = cur + d;
+    *dst = if sum.is_finite() {
+        sum
+    } else {
+        (cur as f64 + d as f64).clamp(-f32::MAX as f64, f32::MAX as f64) as f32
+    };
 }
 
 fn read_delay(line: &[f32], pos: usize, delay: f32) -> f32 {
@@ -252,8 +265,10 @@ fn read_delay(line: &[f32], pos: usize, delay: f32) -> f32 {
     let at = (pos as f32 - delay).rem_euclid(n);
     let i0 = at.floor() as usize % line.len();
     let i1 = (i0 + 1) % line.len();
-    let f = at - at.floor();
-    line[i0] * (1.0 - f) + line[i1] * f
+    let f = (at - at.floor()) as f64;
+    let a = line[i0] as f64;
+    let b = line[i1] as f64;
+    (a + (b - a) * f).clamp(-f32::MAX as f64, f32::MAX as f64) as f32
 }
 
 fn wrap_pi(a: f32) -> f32 {

@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::dynamics::{TP_TAPS, TRUE_PEAK_PHASES};
+use crate::dynamics::{interval_peak, TP_TAPS};
 
 /// |x| at or above this counts as clipped (16-bit full scale).
 pub const CLIP_LEVEL: f32 = 32_767.0 / 32_768.0;
@@ -68,9 +68,19 @@ impl Biquad {
     fn run(&mut self, x: f64) -> f64 {
         // Transposed direct form II.
         let y = self.b[0] * x + self.z[0];
-        self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
-        self.z[1] = self.b[2] * x - self.a[1] * y;
-        y
+        let z0 = self.b[1] * x - self.a[0] * y + self.z[1];
+        let z1 = self.b[2] * x - self.a[1] * y;
+        if !y.is_finite() || !z0.is_finite() || !z1.is_finite() {
+            self.reset();
+            return 0.0;
+        }
+        self.z[0] = if z0.abs() < 1e-300 { 0.0 } else { z0 };
+        self.z[1] = if z1.abs() < 1e-300 { 0.0 } else { z1 };
+        if y.abs() < 1e-300 {
+            0.0
+        } else {
+            y
+        }
     }
 
     fn reset(&mut self) {
@@ -91,7 +101,7 @@ pub struct KWeighting {
 impl KWeighting {
     pub fn new(sample_rate: f64) -> Self {
         let fs = if sample_rate.is_finite() {
-            sample_rate.max(4_000.0)
+            sample_rate.clamp(4_000.0, 768_000.0)
         } else {
             48_000.0
         };
@@ -155,14 +165,19 @@ fn k_weighting(fs: f64) -> (Biquad, Biquad) {
     (shelf, hp)
 }
 
-/// Convert mean K-weighted square power to LUFS (`-inf` when `mean_power <= 0`).
+/// Convert mean K-weighted square power to LUFS (`-inf` when `mean_power <= 0` or `NaN`).
 #[inline]
 pub fn energy_to_lufs(mean_power: f64) -> f64 {
-    if mean_power <= 0.0 {
+    if mean_power.is_nan() || mean_power <= 0.0 {
         f64::NEG_INFINITY
     } else {
         CALIBRATION_OFFSET_DB + 10.0 * mean_power.log10()
     }
+}
+
+fn mean_f64(values: &[f64]) -> f64 {
+    let n = values.len() as f64;
+    values.iter().map(|&z| z / n).sum()
 }
 
 /// BS.1770 two-stage gated integrated loudness from 400 ms block mean
@@ -171,12 +186,12 @@ pub fn integrated_from_block_powers(blocks: &[f64]) -> Option<f64> {
     let abs: Vec<f64> = blocks
         .iter()
         .copied()
-        .filter(|&z| energy_to_lufs(z) >= ABSOLUTE_GATE_LUFS)
+        .filter(|&z| z.is_finite() && energy_to_lufs(z) >= ABSOLUTE_GATE_LUFS)
         .collect();
     if abs.is_empty() {
         return None;
     }
-    let rel = energy_to_lufs(abs.iter().sum::<f64>() / abs.len() as f64) + RELATIVE_GATE_LU;
+    let rel = energy_to_lufs(mean_f64(&abs)) + RELATIVE_GATE_LU;
     let gated: Vec<f64> = abs
         .into_iter()
         .filter(|&z| energy_to_lufs(z) >= rel)
@@ -184,14 +199,12 @@ pub fn integrated_from_block_powers(blocks: &[f64]) -> Option<f64> {
     if gated.is_empty() {
         None
     } else {
-        Some(energy_to_lufs(
-            gated.iter().sum::<f64>() / gated.len() as f64,
-        ))
+        Some(energy_to_lufs(mean_f64(&gated)))
     }
 }
 
 fn to_db(x: f64) -> f64 {
-    if x <= 0.0 {
+    if x.is_nan() || x <= 0.0 {
         f64::NEG_INFINITY
     } else {
         20.0 * x.log10()
@@ -204,20 +217,18 @@ fn to_db(x: f64) -> f64 {
 /// read the cut itself as an over.
 pub fn true_peak(samples: &[f32], channels: u16) -> f32 {
     let ch = channels.max(1) as usize;
+    let frames = samples.len() / ch;
+    let aligned = &samples[..frames * ch];
     let mut peak = 0.0f32;
     for c in 0..ch {
         let mut hist = [0.0f32; TP_TAPS];
-        for (i, raw) in samples.iter().skip(c).step_by(ch).copied().enumerate() {
+        for (i, raw) in aligned.iter().skip(c).step_by(ch).copied().enumerate() {
             let x = if raw.is_finite() { raw } else { 0.0 };
             hist.copy_within(0..TP_TAPS - 1, 1);
             hist[0] = x;
             peak = peak.max(x.abs());
-            if i + 1 < TP_TAPS {
-                continue;
-            }
-            for ph in &TRUE_PEAK_PHASES {
-                let y: f32 = ph.iter().zip(hist.iter()).map(|(a, b)| a * b).sum();
-                peak = peak.max(y.abs());
+            if i + 1 >= TP_TAPS {
+                peak = peak.max(interval_peak(&hist));
             }
         }
     }
@@ -244,6 +255,17 @@ fn k_pass(samples: &[f32], channels: u16, sample_rate: u32) -> KPass {
     // K-weighted power per 100 ms step (sum over channels, G = 1 for
     // L/R/mono per BS.1770).
     let step = ((fs * 0.1).round() as usize).max(1);
+    if frames == 0 {
+        return KPass {
+            steps: Vec::new(),
+            tail: None,
+            step_frames: step,
+            peak: 0.0,
+            clipped: 0,
+            clipped_runs: 0,
+            max_clipped_run: 0,
+        };
+    }
     let mut steps: Vec<f64> = Vec::with_capacity(frames / step + 1);
     let mut filters: Vec<KWeighting> = (0..ch).map(|_| KWeighting::new(fs)).collect();
     let mut acc = 0.0f64;
@@ -362,7 +384,7 @@ fn loudness_range(st_powers: &[f64]) -> f64 {
     if abs.len() < 2 {
         return 0.0;
     }
-    let rel = energy_to_lufs(abs.iter().sum::<f64>() / abs.len() as f64) - 20.0;
+    let rel = energy_to_lufs(mean_f64(&abs)) - 20.0;
     let mut gated: Vec<f64> = abs
         .into_iter()
         .map(energy_to_lufs)
