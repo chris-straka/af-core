@@ -724,8 +724,8 @@ impl Mixer {
 
     fn bus_fold_order(&self) -> [usize; MAX_BUSES] {
         let mut child_count = [0u8; MAX_BUSES];
-        for b in 1..MAX_BUSES {
-            let p = self.buses[b].parent;
+        for bus in self.buses.iter().skip(1) {
+            let p = bus.parent;
             if p >= 0 && (p as usize) < MAX_BUSES {
                 child_count[p as usize] += 1;
             }
