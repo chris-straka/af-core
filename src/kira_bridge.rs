@@ -45,6 +45,11 @@ impl<B: Backend> RealtimePlayer<B> {
     {
         let mut manager =
             AudioManager::<B>::new(settings).map_err(|e| AfError::Kira(format!("{e:?}")))?;
+        if bus_count > 1024 {
+            return Err(AfError::BadArg(format!(
+                "bus_count {bus_count} exceeds maximum 1024"
+            )));
+        }
         let mut tracks = Vec::with_capacity(bus_count);
         for i in 0..bus_count {
             tracks.push(
@@ -90,6 +95,11 @@ impl<B: Backend> RealtimePlayer<B> {
     ) -> Result<()> {
         if pcm.is_empty() {
             return Err(AfError::BadArg("cannot play empty PCM".to_string()));
+        }
+        if pcm.iter().any(|s| !s.is_finite()) {
+            return Err(AfError::BadArg(
+                "PCM contains non-finite sample".to_string(),
+            ));
         }
         if !gain.is_finite() || gain < 0.0 {
             return Err(AfError::BadGain(format!(
@@ -155,6 +165,16 @@ impl<B: Backend> RealtimePlayer<B> {
     ) -> Result<()> {
         if pcm.is_empty() {
             return Err(AfError::BadArg("cannot play empty PCM".to_string()));
+        }
+        if pcm.iter().any(|s| !s.is_finite()) {
+            return Err(AfError::BadArg(
+                "PCM contains non-finite sample".to_string(),
+            ));
+        }
+        if sample_rate == 0 || sample_rate > 768_000 {
+            return Err(AfError::BadArg(format!(
+                "binaural sample_rate must be in 1..=768_000, got {sample_rate}"
+            )));
         }
         if !gain.is_finite() || gain < 0.0 {
             return Err(AfError::BadGain(format!(
@@ -247,5 +267,23 @@ mod tests {
         assert!((gain_to_db(1.0)).abs() < 1e-6);
         assert!((gain_to_db(0.5) + 6.0206).abs() < 1e-3);
         assert!(gain_to_db(0.0).is_finite());
+    }
+
+    #[test]
+    fn rejects_nonfinite_pcm_and_bad_binaural_rate() {
+        let mut player = RealtimePlayer::<MockBackend>::new(AudioManagerSettings::default(), 2)
+            .expect("mock backend manager");
+        assert!(player
+            .play(0, &[0.1, f32::NAN], 1.0, 0.0, 1.0, false)
+            .is_err());
+        assert!(player
+            .play_binaural(0, &[0.1, f32::INFINITY], 1.0, 0.0, 0.0, 1.0, false, 48_000)
+            .is_err());
+        assert!(player
+            .play_binaural(0, &[0.1; 16], 1.0, 0.0, 0.0, 1.0, false, 0)
+            .is_err());
+        assert!(player
+            .play_binaural(0, &[0.1; 16], 1.0, 0.0, 0.0, 1.0, false, u32::MAX)
+            .is_err());
     }
 }

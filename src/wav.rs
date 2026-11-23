@@ -56,13 +56,25 @@ pub fn write_wav<W: Write>(mut w: W, spec: &WavSpec, samples: &[f32]) -> Result<
     if !samples.len().is_multiple_of(spec.channels as usize) {
         return Err(AfError::BadFormat("partial frame in samples".to_string()));
     }
-    let data_bytes = (samples.len() * 2) as u32;
-    let byte_rate = spec.sample_rate * spec.channels as u32 * 2;
+    let byte_len = samples
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| AfError::BadFormat("WAV payload length overflows".to_string()))?;
+    let data_bytes = u32::try_from(byte_len)
+        .map_err(|_| AfError::BadFormat("WAV payload exceeds 4 GiB RIFF limit".to_string()))?;
+    let riff_size = 36u32
+        .checked_add(data_bytes)
+        .ok_or_else(|| AfError::BadFormat("WAV RIFF size exceeds 4 GiB limit".to_string()))?;
+    let byte_rate = spec
+        .sample_rate
+        .checked_mul(spec.channels as u32)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| AfError::BadFormat("WAV byte rate overflows u32".to_string()))?;
     let block_align = spec.channels * 2;
 
     let mut hdr = [0u8; 44];
     hdr[0..4].copy_from_slice(b"RIFF");
-    hdr[4..8].copy_from_slice(&(36 + data_bytes).to_le_bytes());
+    hdr[4..8].copy_from_slice(&riff_size.to_le_bytes());
     hdr[8..12].copy_from_slice(b"WAVE");
     hdr[12..16].copy_from_slice(b"fmt ");
     hdr[16..20].copy_from_slice(&16u32.to_le_bytes());
@@ -78,7 +90,11 @@ pub fn write_wav<W: Write>(mut w: W, spec: &WavSpec, samples: &[f32]) -> Result<
 
     let mut buf = Vec::with_capacity(samples.len() * 2);
     for &s in samples {
-        let c = s.clamp(-1.0, 1.0);
+        let c = if s.is_finite() {
+            s.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
         let q = (c * 32767.0).round() as i16;
         buf.extend_from_slice(&q.to_le_bytes());
     }
@@ -297,7 +313,7 @@ pub fn read_wav_any(bytes: &[u8]) -> Result<WavData> {
                 samples,
             });
         }
-        pos = body.saturating_add(size + (size & 1));
+        pos = body.saturating_add(size.saturating_add(size & 1));
     }
     Err(AfError::BadFormat("no data chunk".to_string()))
 }
@@ -448,5 +464,20 @@ mod tests {
             read_wav(&dup_data[..]),
             Err(AfError::Truncated(_))
         ));
+    }
+
+    #[test]
+    fn write_wav_rejects_u32_byte_rate_overflow() {
+        let mut out = Vec::new();
+        let err = write_wav(
+            &mut out,
+            &WavSpec {
+                channels: 1,
+                sample_rate: u32::MAX,
+            },
+            &[0.0],
+        )
+        .unwrap_err();
+        assert!(matches!(err, AfError::BadFormat(_)));
     }
 }

@@ -112,8 +112,10 @@ impl Reverb {
     /// Allocates all delay lines (control thread).
     pub fn new(params: ReverbParams, sample_rate: u32) -> Result<Self> {
         params.validate()?;
-        if sample_rate == 0 {
-            return Err(AfError::BadArg("reverb sample_rate must be > 0".into()));
+        if sample_rate == 0 || sample_rate > 768_000 {
+            return Err(AfError::BadArg(format!(
+                "reverb sample_rate must be in 1..=768_000, got {sample_rate}"
+            )));
         }
         let scale = sample_rate as f64 / 44_100.0;
         let len = |n: usize, spread: usize| ((n + spread) as f64 * scale).round() as usize;
@@ -142,10 +144,12 @@ impl Reverb {
     /// In-place, 100% wet: input is the mono sum of `l`/`r`; outputs the
     /// stereo tail. No allocation.
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
-        debug_assert_eq!(l.len(), r.len());
+        let n = l.len().min(r.len());
         let (fb, damp) = (self.feedback, self.damp);
-        for i in 0..l.len() {
-            let x = (l[i] + r[i]) * FIXED_GAIN;
+        for i in 0..n {
+            let li = if l[i].is_finite() { l[i] } else { 0.0 };
+            let ri = if r[i].is_finite() { r[i] } else { 0.0 };
+            let x = (li + ri) * FIXED_GAIN;
             for ch in 0..2 {
                 let mut acc = 0.0f32;
                 for c in self.combs[ch].iter_mut() {
@@ -206,5 +210,23 @@ mod tests {
         )
         .is_err());
         assert!(Reverb::new(ReverbParams::default(), 0).is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_rate_and_handles_mismatched_and_nan() {
+        assert!(Reverb::new(ReverbParams::default(), u32::MAX).is_err());
+
+        let mut rv = Reverb::new(ReverbParams::default(), 48_000).unwrap();
+        let mut l = vec![0.0; 16];
+        let mut r = vec![0.0; 4];
+        rv.process(&mut l, &mut r);
+
+        let mut l_nan = vec![f32::NAN, 0.2, f32::INFINITY, 0.0];
+        let mut r_nan = vec![0.0; 4];
+        rv.process(&mut l_nan, &mut r_nan);
+        let mut l2 = vec![0.1; 64];
+        let mut r2 = vec![0.1; 64];
+        rv.process(&mut l2, &mut r2);
+        assert!(l2.iter().chain(&r2).all(|v| v.is_finite()));
     }
 }

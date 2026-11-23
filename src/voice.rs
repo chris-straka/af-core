@@ -255,6 +255,11 @@ fn interp_formants(
 }
 
 fn normalize_fade_clamp(samples: &mut [f32], peak: f32, sample_rate: u32) {
+    for s in samples.iter_mut() {
+        if !s.is_finite() {
+            *s = 0.0;
+        }
+    }
     let max_abs = samples.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     if max_abs > 0.0 {
         let scale = peak / max_abs;
@@ -278,9 +283,9 @@ fn normalize_fade_clamp(samples: &mut [f32], peak: f32, sample_rate: u32) {
 }
 
 fn validate_spec(spec: &VoiceSpec, sample_rate: u32) -> Result<()> {
-    if sample_rate < 8000 {
+    if !(8000..=768_000).contains(&sample_rate) {
         return Err(AfError::BadArg(format!(
-            "voice sample_rate must be >= 8000, got {sample_rate}"
+            "voice sample_rate must be in 8000..=768000, got {sample_rate}"
         )));
     }
     if !spec.duration_secs.is_finite() || spec.duration_secs <= 0.0 || spec.duration_secs > 10.0 {
@@ -396,7 +401,9 @@ pub fn synthesize_voice(spec: &VoiceSpec, sample_rate: u32) -> Result<Vec<f32>> 
     let mut gains = [0.0f32; 3];
     let mut drift: f32 = 0.0;
     let mut phase: f64 = 0.0;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::new();
+    out.try_reserve_exact(n)
+        .map_err(|_| AfError::BadArg(format!("failed to allocate {n} voice frames")))?;
 
     for i in 0..n {
         let t = i as f32 / sr_f;
@@ -845,5 +852,29 @@ mod tests {
         let b = synthesize_voice(&unsorted, 48_000).unwrap();
         assert_eq!(a.len(), b.len());
         assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+    }
+
+    #[test]
+    fn rejects_excessive_rate_and_sanitizes_nonfinite_normalization() {
+        let spec = VoiceSpec {
+            register: VoiceRegister::Mid,
+            duration_secs: 0.2,
+            pitch_keys: vec![(0.0, 0.0)],
+            amp_keys: vec![(0.0, 1.0)],
+            shape_keys: vec![(0.0, MouthShape::A)],
+            breath: 0.1,
+            rough: 0.1,
+            tilt: 1.5,
+            breath_band_keys: vec![(0.0, 1500.0)],
+            peak: 0.5,
+            seed: 7,
+        };
+        assert!(synthesize_voice(&spec, u32::MAX).is_err());
+
+        let mut buf = [0.25f32, f32::INFINITY, f32::NAN, -0.5];
+        normalize_fade_clamp(&mut buf, 0.5, 48_000);
+        assert!(buf
+            .iter()
+            .all(|v| v.is_finite() && (-1.0..=1.0).contains(v)));
     }
 }

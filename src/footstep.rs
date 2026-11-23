@@ -153,8 +153,16 @@ pub fn synthesize_footstep(
             "footstep gain must be finite and >= 0, got {gain}"
         )));
     }
-    if sample_rate == 0 {
-        return Err(AfError::BadArg("footstep sample_rate must be > 0".into()));
+    if sample_rate == 0 || sample_rate > 768_000 {
+        return Err(AfError::BadArg(format!(
+            "footstep sample_rate must be in 1..=768_000, got {sample_rate}"
+        )));
+    }
+    let max_frames = sample_rate as usize * 60;
+    if frames > max_frames {
+        return Err(AfError::BadArg(format!(
+            "footstep frames {frames} exceeds 60s limit ({max_frames})"
+        )));
     }
     let v = surface_voice(surface);
     let mut rng = seed ^ SEED_SALT ^ surface.index().wrapping_mul(0x85EB_CA6B);
@@ -168,7 +176,9 @@ pub fn synthesize_footstep(
     }
     let inv_rate = 1.0 / sample_rate as f32;
     let mut lp = 0.0f32;
-    let mut out = Vec::with_capacity(frames);
+    let mut out = Vec::new();
+    out.try_reserve_exact(frames)
+        .map_err(|_| AfError::BadArg(format!("failed to allocate {frames} footstep frames")))?;
     for i in 0..frames {
         let t = i as f32 * inv_rate;
         let w = urand(&mut rng);
@@ -257,7 +267,13 @@ pub fn anim_frame_to_audio_frame(anim_frame: u64, anim_fps: f32, sample_rate: u3
             "anim_fps must be finite and > 0, got {anim_fps}"
         )));
     }
-    Ok((anim_frame as f64 * sample_rate as f64 / anim_fps as f64).round() as u64)
+    let raw = (anim_frame as f64 * sample_rate as f64 / anim_fps as f64).round();
+    if !raw.is_finite() || raw < 0.0 || raw >= u64::MAX as f64 {
+        return Err(AfError::BadArg(
+            "audio frame calculation overflows u64".to_string(),
+        ));
+    }
+    Ok(raw as u64)
 }
 
 /// Output statistics for surface A/B differentiation.
@@ -364,5 +380,11 @@ mod tests {
         assert!(anim_frame_to_audio_frame(1, 0.0, 48_000).is_err());
         assert_eq!(Surface::from_tag("metal"), Some(Surface::Metal));
         assert_eq!(Surface::from_tag("Metal"), None);
+    }
+
+    #[test]
+    fn rejects_excessive_frames_and_frame_mapping_overflow() {
+        assert!(synthesize_footstep(Surface::Wood, 1, 1.0, 48_000, usize::MAX).is_err());
+        assert!(anim_frame_to_audio_frame(u64::MAX, 1.0, 48_000).is_err());
     }
 }

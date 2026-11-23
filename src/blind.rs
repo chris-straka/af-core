@@ -172,9 +172,15 @@ fn load_stereo_wav(path: &Path) -> Result<LoadedSource> {
         read_wav_any(&bytes).map_err(|e| AfError::BadFormat(format!("{}: {e}", path.display())))?;
     let sr = wav.spec.sample_rate;
     let ch = wav.spec.channels;
-    if sr < 8_000 {
+    if !(8_000..=768_000).contains(&sr) {
         return Err(AfError::BadFormat(format!(
-            "{}: sample rate {sr} Hz is below 8000 Hz",
+            "{}: sample rate {sr} Hz out of range (8000..=768000)",
+            path.display()
+        )));
+    }
+    if wav.samples.iter().any(|s| !s.is_finite()) {
+        return Err(AfError::BadFormat(format!(
+            "{}: WAV contains non-finite samples",
             path.display()
         )));
     }
@@ -977,8 +983,15 @@ pub fn score_blind_pack(
     let mut control_answer = String::new();
     let mut control_ok = false;
     let mut per_pair = Vec::with_capacity(key.pairs.len());
+    let mut seen_ids = std::collections::BTreeSet::new();
 
     for p in &key.pairs {
+        if !seen_ids.insert(p.pair_id.as_str()) {
+            return Err(AfError::BadFormat(format!(
+                "duplicate pair_id {} in key file",
+                p.pair_id
+            )));
+        }
         let raw = answers
             .get(&p.pair_id)
             .ok_or_else(|| AfError::BadArg(format!("answers missing entry for {}", p.pair_id)))?;
@@ -1024,4 +1037,78 @@ pub fn score_blind_pack(
         pass,
         per_pair,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_float32_wav(path: &Path, sr: u32, samples: &[f32]) {
+        let data_bytes = (samples.len() * 4) as u32;
+        let mut out = Vec::with_capacity(44 + data_bytes as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&sr.to_le_bytes());
+        out.extend_from_slice(&(sr.saturating_mul(4)).to_le_bytes());
+        out.extend_from_slice(&4u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_bytes.to_le_bytes());
+        for &s in samples {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn rejects_excessive_rate_nonfinite_wav_and_duplicate_pair_ids() {
+        let dir = std::env::temp_dir().join(format!("af_blind_red_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hi_sr = dir.join("hi_sr.wav");
+        write_float32_wav(&hi_sr, 2_000_000, &[0.1, 0.2]);
+        assert!(load_stereo_wav(&hi_sr).is_err());
+
+        let nan_wav = dir.join("nan.wav");
+        write_float32_wav(&nan_wav, 48_000, &[0.1, f32::NAN]);
+        assert!(load_stereo_wav(&nan_wav).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let key = BlindKeyFile {
+            seed: 1,
+            clip_secs: 6.0,
+            pairs: vec![
+                BlindPairKey {
+                    pair_id: "p1".into(),
+                    source_stem: "s".into(),
+                    fault: BlindFault::SameControl,
+                    clean_side: Side::Same,
+                    gate_choice: Side::Same,
+                    control: true,
+                    a_gate_pass: true,
+                    a_breaches: vec![],
+                    b_gate_pass: true,
+                    b_breaches: vec![],
+                },
+                BlindPairKey {
+                    pair_id: "p1".into(),
+                    source_stem: "s".into(),
+                    fault: BlindFault::ClippedHit,
+                    clean_side: Side::A,
+                    gate_choice: Side::B,
+                    control: false,
+                    a_gate_pass: true,
+                    a_breaches: vec![],
+                    b_gate_pass: false,
+                    b_breaches: vec!["clip".into()],
+                },
+            ],
+        };
+        let mut answers = BTreeMap::new();
+        answers.insert("p1".to_string(), "same".to_string());
+        assert!(score_blind_pack(&key, &answers).is_err());
+    }
 }
