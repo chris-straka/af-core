@@ -22,9 +22,13 @@ use kira::{
 
 use crate::error::{AfError, Result};
 
-/// Linear amplitude -> dB, floored at -120 dB so gain 0 stays finite.
+/// Linear amplitude -> dB, floored at -120 dB so gain 0 or non-finite stays finite.
 pub fn gain_to_db(gain: f32) -> f32 {
-    20.0 * gain.max(1e-6).log10()
+    if !gain.is_finite() || gain <= 0.0 {
+        -120.0
+    } else {
+        20.0 * gain.max(1e-6).log10()
+    }
 }
 
 fn db(gain: f32) -> Decibels {
@@ -200,7 +204,11 @@ impl<B: Backend> RealtimePlayer<B> {
         let frames: Arc<[Frame]> = l
             .iter()
             .zip(&r)
-            .map(|(&a, &b)| Frame::new(a * gain, b * gain))
+            .map(|(&a, &b)| {
+                let la = (a as f64 * gain as f64).clamp(-f32::MAX as f64, f32::MAX as f64) as f32;
+                let rb = (b as f64 * gain as f64).clamp(-f32::MAX as f64, f32::MAX as f64) as f32;
+                Frame::new(la, rb)
+            })
             .collect::<Vec<_>>()
             .into();
         let mut settings = StaticSoundSettings::new()

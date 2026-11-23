@@ -319,7 +319,7 @@ pub fn engagement_from_series(
     let mut runs = 0u32;
     let mut unengaged_secs = GAP_SECS;
     let mut max_gr = 0.0f64;
-    let mut sum_gr = 0.0f64;
+    let mut mean_gr = 0.0f64;
     let mut prev_t = 0.0f64;
     for &(t, gr) in &series {
         let dt = if t.is_finite() {
@@ -332,7 +332,7 @@ pub fn engagement_from_series(
         let gr = if gr.is_finite() { gr.max(0.0) } else { 0.0 };
         if gr >= ENGAGE_THRESHOLD_DB {
             engaged += 1;
-            sum_gr += gr;
+            mean_gr += (gr - mean_gr) / engaged as f64;
             if unengaged_secs + 1e-9 >= GAP_SECS {
                 runs += 1;
             }
@@ -349,11 +349,7 @@ pub fn engagement_from_series(
         engaged_percent: 100.0 * engaged as f64 / total,
         engagements: runs,
         max_reduction_db: max_gr,
-        mean_reduction_db: if engaged > 0 {
-            sum_gr / engaged as f64
-        } else {
-            0.0
-        },
+        mean_reduction_db: mean_gr,
         series,
     }
 }
@@ -569,9 +565,9 @@ fn evaluate_ducking(
         } else {
             &active_cue
         };
-        let mut drop_sum = 0.0f64;
+        let mut mean_drop = 0.0f64;
         let mut drop_cnt = 0usize;
-        let mut clar_sum = 0.0f64;
+        let mut mean_clar = 0.0f64;
         let mut clar_cnt = 0usize;
         for (w, (&raw_drop, &is_active)) in d.drop_db.iter().zip(mask.iter()).enumerate() {
             if !is_active {
@@ -582,47 +578,62 @@ fn evaluate_ducking(
             } else {
                 0.0
             };
-            drop_sum += dr;
             drop_cnt += 1;
+            mean_drop += (dr - mean_drop) / drop_cnt as f64;
             if let (Some(&cue), Some(&bed)) = (tel.cue_rms_db.get(w), d.bed_rms_db.get(w)) {
                 if cue.is_finite() && bed.is_finite() && bed >= BED_ACTIVE_DB {
-                    clar_sum += cue - bed;
-                    clar_cnt += 1;
+                    let diff = cue - bed;
+                    if diff.is_finite() {
+                        clar_cnt += 1;
+                        mean_clar += (diff - mean_clar) / clar_cnt as f64;
+                    }
                 }
             }
         }
-        let mean_drop_under_cue = if drop_cnt > 0 {
-            drop_sum / drop_cnt as f64
+        let mean_drop_under_cue = mean_drop;
+        let clarity_db = (clar_cnt > 0).then_some(mean_clar);
+        let open_clarity_db = clarity_db.map(|c| c - mean_drop_under_cue);
+
+        let hold_ms = if d.hold_ms.is_finite() {
+            d.hold_ms.max(0.0) as f64
         } else {
             0.0
         };
-        let clarity_db = (clar_cnt > 0).then_some(clar_sum / clar_cnt as f64);
-        let open_clarity_db = clarity_db.map(|c| c - mean_drop_under_cue);
-
-        let settle_needed = (d.hold_ms.max(0.0) + d.release_ms.max(0.0)) as f64 * 1e-3 + 0.20;
+        let release_ms = if d.release_ms.is_finite() {
+            d.release_ms.max(0.0) as f64
+        } else {
+            0.0
+        };
+        let amount_db = if d.amount_db.is_finite() {
+            d.amount_db.max(0.0)
+        } else {
+            0.0
+        };
+        let settle_needed = (hold_ms + release_ms) * 1e-3 + 0.20;
         let recovered = match last_cue_end_secs {
             Some(end_t) if duration_secs >= end_t + settle_needed => {
-                d.drop_db.last().copied().unwrap_or(0.0) <= 0.5
+                let last = d.drop_db.last().copied().unwrap_or(0.0);
+                last.is_finite() && last <= 0.5
             }
             _ => true,
         };
 
-        let expected_drop = limits.min_cue_drop_db.min(d.amount_db as f64 * 0.4);
-        if use_sustained && mean_drop_under_cue < expected_drop {
+        let expected_drop = limits.min_cue_drop_db.min(amount_db as f64 * 0.4);
+        if use_sustained && (expected_drop.is_nan() || mean_drop_under_cue < expected_drop) {
             breaches.push(format!(
                 "bus {:?} ducked only {:.1} dB under sustained sidechain cues < {:.1} dB",
                 d.bus, mean_drop_under_cue, expected_drop
             ));
         }
         if let Some(clar) = clarity_db {
-            if use_sustained && clar < limits.min_clarity_db {
+            if use_sustained && (limits.min_clarity_db.is_nan() || clar < limits.min_clarity_db) {
                 breaches.push(format!(
                     "bus {:?} drowns sidechain cues (clarity {:+.1} dB < {:+.1} dB)",
                     d.bus, clar, limits.min_clarity_db
                 ));
             }
         }
-        if ducked_percent > limits.max_ducked_percent {
+        if limits.max_ducked_percent.is_nan() || ducked_percent > limits.max_ducked_percent {
             breaches.push(format!(
                 "bus {:?} ducked {:.1}% of the time > {:.1}%",
                 d.bus, ducked_percent, limits.max_ducked_percent
@@ -638,7 +649,7 @@ fn evaluate_ducking(
         drop_series.push((d.bus.clone(), d.drop_db.clone()));
         buses.push(BusDuckCheck {
             bus: d.bus.clone(),
-            target_amount_db: d.amount_db,
+            target_amount_db: amount_db,
             max_drop_db: max_drop,
             mean_drop_under_cue_db: mean_drop_under_cue,
             ducked_percent,
@@ -700,6 +711,22 @@ pub fn check_with_telemetry(
     };
 
     let mut breaches = Vec::new();
+    // Guard NaN thresholds so malformed limits can never silently pass.
+    if limits.ceiling_dbtp.is_nan()
+        || limits.min_lufs.is_nan()
+        || limits.max_lufs.is_nan()
+        || limits.max_short_term_lufs.is_some_and(f64::is_nan)
+        || limits.max_engaged_percent.is_nan()
+        || limits.max_reduction_db.is_nan()
+        || limits.silence_floor_lufs.is_nan()
+        || limits.max_silence_secs.is_nan()
+        || limits.max_silent_percent.is_nan()
+        || limits.min_cue_drop_db.is_nan()
+        || limits.min_clarity_db.is_nan()
+        || limits.max_ducked_percent.is_nan()
+    {
+        breaches.push("invalid NaN threshold in PlaythroughLimits".to_string());
+    }
     // Allow 0.02 dB float/WAV rounding tolerance around ceiling_dbtp.
     if loud.true_peak_dbtp > limits.ceiling_dbtp as f64 + 0.02 {
         breaches.push(format!(

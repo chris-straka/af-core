@@ -51,7 +51,12 @@ impl Vec3 {
 
     /// Component-wise linear interpolation, `t` in [0, 1].
     pub fn lerp(self, o: Vec3, t: f32) -> Vec3 {
-        self + (o - self).scale(t)
+        let t = t as f64;
+        Vec3::new(
+            (self.x as f64 + (o.x as f64 - self.x as f64) * t) as f32,
+            (self.y as f64 + (o.y as f64 - self.y as f64) * t) as f32,
+            (self.z as f64 + (o.z as f64 - self.z as f64) * t) as f32,
+        )
     }
 }
 
@@ -150,26 +155,32 @@ impl Attenuation {
     }
 
     fn gain_unchecked(&self, distance: f32) -> f32 {
-        let (r, m, k) = (self.ref_distance, self.max_distance, self.rolloff);
-        if distance <= r {
+        let (r, m, k, d) = (
+            self.ref_distance as f64,
+            self.max_distance as f64,
+            self.rolloff as f64,
+            distance as f64,
+        );
+        if d <= r {
             return 1.0;
         }
-        let over = distance - r;
-        match self.curve {
+        let over = d - r;
+        let g = match self.curve {
             AttenuationCurve::Linear => {
-                if distance >= m {
+                if d >= m {
                     0.0
                 } else {
                     1.0 - over / (m - r)
                 }
             }
-            AttenuationCurve::Inverse => (r / (r + k * over)).max(0.0),
+            AttenuationCurve::Inverse => r / (r + k * over),
             AttenuationCurve::InverseSquare => {
                 let g = r / (r + k * over);
                 g * g
             }
             AttenuationCurve::Exponential => (-k * over / r).exp(),
-        }
+        };
+        g.clamp(0.0, 1.0) as f32
     }
 }
 
@@ -226,8 +237,10 @@ pub fn lowpass_coeff(amount01: f32, sample_rate: u32) -> f32 {
     if sample_rate == 0 {
         return 1.0;
     }
-    let fc = fc.min(0.45 * sample_rate as f32);
-    1.0 - (-2.0 * std::f32::consts::PI * fc / sample_rate as f32).exp()
+    let sr = sample_rate as f64;
+    let fc = (fc as f64).min(0.45 * sr);
+    let c = -((-2.0 * std::f64::consts::PI * fc / sr).exp_m1());
+    (c as f32).clamp(1e-7, 1.0)
 }
 
 /// Strength of an occlusion/obstruction pair for the low-pass.
@@ -282,8 +295,11 @@ pub fn place_emitter(
             "emitter/listener position and yaw must be finite".to_string(),
         ));
     }
-    let d = emitter - listener.position;
-    let distance = d.length();
+    let dx = emitter.x as f64 - listener.position.x as f64;
+    let dy = emitter.y as f64 - listener.position.y as f64;
+    let dz = emitter.z as f64 - listener.position.z as f64;
+    let dist64 = (dx * dx + dy * dy + dz * dz).sqrt();
+    let distance = dist64.min(f32::MAX as f64) as f32;
     let dist_gain = att.gain(distance)?;
     let occ_gain = occlusion_gain(occ.occlusion, occlusion_floor)?;
     if !occ.obstruction.is_finite() || !(0.0..=1.0).contains(&occ.obstruction) {
@@ -294,16 +310,16 @@ pub fn place_emitter(
     }
     // Rotate the offset into listener space (yaw about +Y). At yaw 0 the
     // listener faces -Z: ahead is -Z, right is +X.
-    let (s, c) = listener.yaw.sin_cos();
-    let rx = c * d.x - s * d.z;
-    let rz = s * d.x + c * d.z;
-    let ry = d.y;
-    let horizontal = (rx as f64).hypot(rz as f64) as f32;
-    let (pan, azimuth, elevation) = if distance <= 1e-6 {
+    let (s, c) = (listener.yaw as f64).sin_cos();
+    let rx = c * dx - s * dz;
+    let rz = s * dx + c * dz;
+    let ry = dy;
+    let horizontal = rx.hypot(rz);
+    let (pan, azimuth, elevation) = if dist64 <= 1e-6 {
         (0.0, 0.0, 0.0)
     } else {
-        let az = rx.atan2(-rz);
-        (pan_from_azimuth(az)?, az, ry.atan2(horizontal))
+        let az = rx.atan2(-rz) as f32;
+        (pan_from_azimuth(az)?, az, ry.atan2(horizontal) as f32)
     };
     Ok(Placement {
         gain: dist_gain * occ_gain,

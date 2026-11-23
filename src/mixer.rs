@@ -161,10 +161,50 @@ impl Default for Bus {
 }
 
 #[inline]
+fn add_finite(dst: &mut f32, delta: f32) {
+    let sum = *dst + delta;
+    if sum.is_finite() {
+        *dst = sum;
+    } else {
+        let cur = if dst.is_finite() { *dst as f64 } else { 0.0 };
+        let d = if delta.is_finite() {
+            delta as f64
+        } else if delta.is_nan() {
+            0.0
+        } else {
+            delta.signum() as f64 * f32::MAX as f64
+        };
+        *dst = (cur + d).clamp(-f32::MAX as f64, f32::MAX as f64) as f32;
+    }
+}
+
+#[inline]
+fn scale_finite(val: f32, gain: f32) -> f32 {
+    let prod = val * gain;
+    if prod.is_finite() {
+        prod
+    } else if val.is_nan() || gain.is_nan() {
+        0.0
+    } else {
+        (val as f64 * gain as f64).clamp(-f32::MAX as f64, f32::MAX as f64) as f32
+    }
+}
+
+fn fold_bus_channel(acc: &mut [f32], child: usize, parent: usize, n: usize, gain: f32) {
+    let c_off = child * MAX_BLOCK;
+    let p_off = parent * MAX_BLOCK;
+    for i in 0..n {
+        let delta = scale_finite(acc[c_off + i], gain);
+        add_finite(&mut acc[p_off + i], delta);
+    }
+}
+
+#[inline]
 fn sample_voice_frame(data: &[f32], pos: f64, is_loop: bool, src_len: usize) -> Option<f32> {
     if !pos.is_finite() || pos < 0.0 || data.is_empty() {
         return None;
     }
+    let clean = |v: f32| if v.is_finite() { v } else { 0.0 };
     if is_loop {
         if src_len == 0 {
             return None;
@@ -176,18 +216,28 @@ fn sample_voice_frame(data: &[f32], pos: f64, is_loop: bool, src_len: usize) -> 
         };
         let idx = (wrapped.floor() as usize) % src_len;
         let frac = (wrapped - wrapped.floor()) as f32;
-        let s0 = data[idx];
-        let s1 = data[(idx + 1) % src_len];
-        Some(s0 + (s1 - s0) * frac)
+        let s0 = clean(data[idx]);
+        let s1 = clean(data[(idx + 1) % src_len]);
+        let diff = s1 - s0;
+        Some(if diff.is_finite() {
+            s0 + diff * frac
+        } else {
+            (s0 as f64 + (s1 as f64 - s0 as f64) * frac as f64) as f32
+        })
     } else {
         if pos >= data.len() as f64 {
             return None;
         }
         let idx = pos.floor() as usize;
         let frac = (pos - idx as f64) as f32;
-        let s0 = data[idx];
-        let s1 = data.get(idx + 1).copied().unwrap_or(0.0);
-        Some(s0 + (s1 - s0) * frac)
+        let s0 = clean(data[idx]);
+        let s1 = data.get(idx + 1).copied().map(clean).unwrap_or(0.0);
+        let diff = s1 - s0;
+        Some(if diff.is_finite() {
+            s0 + diff * frac
+        } else {
+            (s0 as f64 + (s1 as f64 - s0 as f64) * frac as f64) as f32
+        })
     }
 }
 
@@ -196,10 +246,10 @@ pub struct Mixer {
     buses: [Bus; MAX_BUSES],
     /// Optional 100%-wet reverb insert per bus (zone returns).
     reverbs: [Option<Reverb>; MAX_BUSES],
-    acc_l: [[f32; MAX_BLOCK]; MAX_BUSES],
-    acc_r: [[f32; MAX_BLOCK]; MAX_BUSES],
+    acc_l: Box<[f32]>,
+    acc_r: Box<[f32]>,
     /// Mono scratch for the binaural path (control: never reallocates).
-    scratch: [f32; MAX_BLOCK],
+    scratch: Box<[f32]>,
     /// Per-bus post-gain stats (do not affect audio; for `af render` reports).
     stat_peak: [f32; MAX_BUSES],
     stat_sum_sq: [f64; MAX_BUSES],
@@ -207,15 +257,15 @@ pub struct Mixer {
     /// Sample rate for binaural HRTF state (control thread only).
     sample_rate: u32,
     /// Ducking key: summed output of sidechain voices (pre bus gain).
-    key_l: [f32; MAX_BLOCK],
-    key_r: [f32; MAX_BLOCK],
+    key_l: Box<[f32]>,
+    key_r: Box<[f32]>,
     /// Key level per frame (dBFS), then per-bus duck gain scratch.
-    key_db: [f32; MAX_BLOCK],
-    duck_gain: [f32; MAX_BLOCK],
+    key_db: Box<[f32]>,
+    duck_gain: Box<[f32]>,
     /// Sidechain voices' signal at the master summing junction (telemetry
     /// only; its own buffers, so ducking never shares scratch with it).
-    heard_key_l: [f32; MAX_BLOCK],
-    heard_key_r: [f32; MAX_BLOCK],
+    heard_key_l: Box<[f32]>,
+    heard_key_r: Box<[f32]>,
     key: KeyDetector,
     /// Optional ducker per bus (never on the master).
     duckers: [Option<Ducker>; MAX_BUSES],
@@ -242,19 +292,19 @@ impl Default for Mixer {
             voices: std::array::from_fn(|_| Voice::default()),
             buses,
             reverbs: std::array::from_fn(|_| None),
-            acc_l: [[0.0; MAX_BLOCK]; MAX_BUSES],
-            acc_r: [[0.0; MAX_BLOCK]; MAX_BUSES],
-            scratch: [0.0; MAX_BLOCK],
+            acc_l: vec![0.0; MAX_BUSES * MAX_BLOCK].into_boxed_slice(),
+            acc_r: vec![0.0; MAX_BUSES * MAX_BLOCK].into_boxed_slice(),
+            scratch: vec![0.0; MAX_BLOCK].into_boxed_slice(),
             stat_peak: [0.0; MAX_BUSES],
             stat_sum_sq: [0.0; MAX_BUSES],
             stat_frames: 0,
             sample_rate: 48_000,
-            key_l: [0.0; MAX_BLOCK],
-            key_r: [0.0; MAX_BLOCK],
-            key_db: [0.0; MAX_BLOCK],
-            duck_gain: [0.0; MAX_BLOCK],
-            heard_key_l: [0.0; MAX_BLOCK],
-            heard_key_r: [0.0; MAX_BLOCK],
+            key_l: vec![0.0; MAX_BLOCK].into_boxed_slice(),
+            key_r: vec![0.0; MAX_BLOCK].into_boxed_slice(),
+            key_db: vec![0.0; MAX_BLOCK].into_boxed_slice(),
+            duck_gain: vec![0.0; MAX_BLOCK].into_boxed_slice(),
+            heard_key_l: vec![0.0; MAX_BLOCK].into_boxed_slice(),
+            heard_key_r: vec![0.0; MAX_BLOCK].into_boxed_slice(),
             key: KeyDetector::new(48_000),
             duckers: [None; MAX_BUSES],
             limiter: None,
@@ -368,19 +418,24 @@ impl Mixer {
         if parent < 0 {
             return 0.0;
         }
-        let pg = self.chain_gain_to_master(parent as usize) as f64;
-        self.block_sum_sq[b] * pg * pg
+        let pg = self.chain_gain_to_master_f64(parent as usize);
+        let energy = self.block_sum_sq[b] * pg * pg;
+        if energy.is_finite() {
+            energy
+        } else {
+            f64::MAX
+        }
     }
 
-    fn chain_gain_to_master(&self, mut bus: usize) -> f32 {
-        let mut g = 1.0f32;
+    fn chain_gain_to_master_f64(&self, mut bus: usize) -> f64 {
+        let mut g = 1.0f64;
         let mut hops = 0usize;
         while bus > 0 && hops < MAX_BUSES {
             let b = &self.buses[bus];
             if b.parent < 0 {
                 return 0.0;
             }
-            g *= b.gain;
+            g *= b.gain as f64;
             bus = b.parent as usize;
             hops += 1;
         }
@@ -405,11 +460,13 @@ impl Mixer {
         let rms = if self.stat_frames == 0 {
             0.0
         } else {
-            (self.stat_sum_sq[b] / (2.0 * self.stat_frames as f64)) as f32
+            (self.stat_sum_sq[b] / (2.0 * self.stat_frames as f64))
+                .sqrt()
+                .min(f32::MAX as f64) as f32
         };
         Ok(BusStats {
             peak: self.stat_peak[b],
-            rms: rms.sqrt(),
+            rms,
         })
     }
 
@@ -519,6 +576,13 @@ impl Mixer {
                 return Err(AfError::BadBus(format!(
                     "send bus index {sb} out of range (max {})",
                     MAX_BUSES - 1
+                )));
+            }
+        }
+        if let Some((az, el)) = p.binaural {
+            if !az.is_finite() || !el.is_finite() {
+                return Err(AfError::BadArg(format!(
+                    "binaural direction must be finite, got ({az}, {el})"
                 )));
             }
         }
@@ -658,6 +722,32 @@ impl Mixer {
         self.voices.get(slot).filter(|v| v.active).map(|v| v.start)
     }
 
+    fn bus_fold_order(&self) -> [usize; MAX_BUSES] {
+        let mut child_count = [0u8; MAX_BUSES];
+        for b in 1..MAX_BUSES {
+            let p = self.buses[b].parent;
+            if p >= 0 && (p as usize) < MAX_BUSES {
+                child_count[p as usize] += 1;
+            }
+        }
+        let mut done = [false; MAX_BUSES];
+        let mut order = [0usize; MAX_BUSES];
+        for slot in &mut order {
+            // Highest-index ready bus first keeps standard 1..7->0 in 7..=0 order.
+            let next = (0..MAX_BUSES)
+                .rev()
+                .find(|&b| !done[b] && child_count[b] == 0)
+                .unwrap_or(0);
+            done[next] = true;
+            let p = self.buses[next].parent;
+            if p >= 0 && (p as usize) < MAX_BUSES {
+                child_count[p as usize] = child_count[p as usize].saturating_sub(1);
+            }
+            *slot = next;
+        }
+        order
+    }
+
     /// Render `out.len()` frames starting at absolute frame `start_frame`.
     /// Deterministic: same voices/params/frames => bit-identical floats.
     /// No allocation (member scratch only). `out_l`/`out_r` must match len.
@@ -665,9 +755,13 @@ impl Mixer {
         assert_eq!(out_l.len(), out_r.len());
         let n = out_l.len();
         assert!(n <= MAX_BLOCK, "block of {n} exceeds MAX_BLOCK {MAX_BLOCK}");
+        if n == 0 {
+            return;
+        }
         for b in 0..MAX_BUSES {
-            self.acc_l[b][..n].fill(0.0);
-            self.acc_r[b][..n].fill(0.0);
+            let off = b * MAX_BLOCK;
+            self.acc_l[off..off + n].fill(0.0);
+            self.acc_r[off..off + n].fill(0.0);
         }
         self.block_sum_sq = [0.0; MAX_BUSES];
         let ducking = self.duckers.iter().any(Option::is_some);
@@ -676,7 +770,7 @@ impl Mixer {
         if sidechain_active {
             bus_chain_gains[0] = 1.0;
             for (b, slot) in bus_chain_gains.iter_mut().enumerate().skip(1) {
-                *slot = self.chain_gain_to_master(b);
+                *slot = self.chain_gain_to_master_f64(b).min(f32::MAX as f64) as f32;
             }
             self.heard_key_l[..n].fill(0.0);
             self.heard_key_r[..n].fill(0.0);
@@ -691,6 +785,7 @@ impl Mixer {
             }
             let src_len = v.loop_frames.unwrap_or(v.data.len()) as f64;
             // Output length of a one-shot at this rate (loops run forever).
+            let is_loop = v.loop_frames.is_some();
             let out_len = match v.loop_frames {
                 Some(_) => u64::MAX,
                 None => (v.data.len() as f64 / v.rate).ceil() as u64,
@@ -708,8 +803,8 @@ impl Mixer {
             if v.t_binaural.is_some() {
                 let (az, el) = v.t_binaural.unwrap_or((0.0, 0.0));
                 let bus = v.bus as usize;
+                let bus_off = bus * MAX_BLOCK;
                 let rate = v.rate;
-                let is_loop = v.loop_frames.is_some();
                 let filt = v.lowpass < 1.0;
                 let inv_n = 1.0 / n as f32;
                 let scratch = &mut self.scratch[..n];
@@ -726,31 +821,44 @@ impl Mixer {
                         continue;
                     };
                     if filt {
-                        v.lp_state += v.lowpass * (src - v.lp_state);
+                        let next =
+                            v.lp_state as f64 + v.lowpass as f64 * (src as f64 - v.lp_state as f64);
+                        v.lp_state = if !next.is_finite() || next.abs() < 1e-30 {
+                            0.0
+                        } else {
+                            next.clamp(-f32::MAX as f64, f32::MAX as f64) as f32
+                        };
                         src = v.lp_state;
                     }
                     let t = (i + 1) as f32 * inv_n;
-                    *slot = src * (v.gain + (v.target_gain - v.gain) * t);
+                    let g = v.gain + (v.target_gain - v.gain) * t;
+                    *slot = scale_finite(src, g);
                 }
                 v.gain = v.target_gain;
                 v.target_pan = v.pan;
                 let st = v.bin_state.as_mut().expect("binaural voice without state");
-                let (al, ar) = (&mut self.acc_l[bus], &mut self.acc_r[bus]);
-                st.process_into(&self.scratch[..n], az, el, &mut al[..n], &mut ar[..n]);
+                st.process_into(
+                    &self.scratch[..n],
+                    az,
+                    el,
+                    &mut self.acc_l[bus_off..bus_off + n],
+                    &mut self.acc_r[bus_off..bus_off + n],
+                );
                 if v.sidechain {
                     let cg = bus_chain_gains[bus];
                     for (i, &x) in self.scratch[..n].iter().enumerate() {
-                        self.heard_key_l[i] += x * cg;
-                        self.heard_key_r[i] += x * cg;
+                        let scaled = scale_finite(x, cg);
+                        add_finite(&mut self.heard_key_l[i], scaled);
+                        add_finite(&mut self.heard_key_r[i], scaled);
                         if ducking {
                             // Key from the mono voice (pre-HRTF): its level, not
                             // its direction, drives the ducking.
-                            self.key_l[i] += x;
-                            self.key_r[i] += x;
+                            add_finite(&mut self.key_l[i], x);
+                            add_finite(&mut self.key_r[i], x);
                         }
                     }
                 }
-                if end != u64::MAX && start_frame.saturating_add(n as u64) >= end {
+                if !is_loop && start_frame.saturating_add(n as u64) >= end {
                     v.active = false;
                 }
                 continue;
@@ -762,13 +870,13 @@ impl Mixer {
             let filt = v.lowpass < 1.0;
             let send = v.send_bus >= 0 && (v.send_gain > 0.0 || v.target_send > 0.0);
             let bus = v.bus as usize;
+            let bus_off = bus * MAX_BLOCK;
             let rate = v.rate;
-            let is_loop = v.loop_frames.is_some();
             let key = v.sidechain;
             if ramp || filt || send || key {
                 // Spatial path (P2): per-sample ramp, filter, send.
                 let inv_n = 1.0 / n as f32;
-                let sbus = v.send_bus.max(0) as usize;
+                let sbus_off = v.send_bus.max(0) as usize * MAX_BLOCK;
                 let cg = bus_chain_gains[bus];
                 for i in 0..n {
                     let f = start_frame.saturating_add(i as u64);
@@ -781,7 +889,13 @@ impl Mixer {
                         continue;
                     };
                     if filt {
-                        v.lp_state += v.lowpass * (src - v.lp_state);
+                        let next =
+                            v.lp_state as f64 + v.lowpass as f64 * (src as f64 - v.lp_state as f64);
+                        v.lp_state = if !next.is_finite() || next.abs() < 1e-30 {
+                            0.0
+                        } else {
+                            next.clamp(-f32::MAX as f64, f32::MAX as f64) as f32
+                        };
                         src = v.lp_state;
                     }
                     let t = (i + 1) as f32 * inv_n;
@@ -790,30 +904,30 @@ impl Mixer {
                     } else {
                         (gl, gr)
                     };
-                    let vl = src * l;
-                    let vr = src * r;
-                    self.acc_l[bus][i] += vl;
-                    self.acc_r[bus][i] += vr;
+                    let vl = scale_finite(src, l);
+                    let vr = scale_finite(src, r);
+                    add_finite(&mut self.acc_l[bus_off + i], vl);
+                    add_finite(&mut self.acc_r[bus_off + i], vr);
                     if key {
-                        self.heard_key_l[i] += vl * cg;
-                        self.heard_key_r[i] += vr * cg;
+                        add_finite(&mut self.heard_key_l[i], scale_finite(vl, cg));
+                        add_finite(&mut self.heard_key_r[i], scale_finite(vr, cg));
                         if ducking {
-                            self.key_l[i] += vl;
-                            self.key_r[i] += vr;
+                            add_finite(&mut self.key_l[i], vl);
+                            add_finite(&mut self.key_r[i], vr);
                         }
                     }
                     if send {
                         let g = v.gain + (v.target_gain - v.gain) * t;
                         let sg = v.send_gain + (v.target_send - v.send_gain) * t;
-                        let x = src * g * sg;
-                        self.acc_l[sbus][i] += x;
-                        self.acc_r[sbus][i] += x;
+                        let x = scale_finite(scale_finite(src, g), sg);
+                        add_finite(&mut self.acc_l[sbus_off + i], x);
+                        add_finite(&mut self.acc_r[sbus_off + i], x);
                     }
                 }
                 v.gain = v.target_gain;
                 v.pan = v.target_pan;
                 v.send_gain = v.target_send;
-                if end != u64::MAX && start_frame.saturating_add(n as u64) >= end {
+                if !is_loop && start_frame.saturating_add(n as u64) >= end {
                     v.active = false;
                 }
                 continue;
@@ -827,10 +941,10 @@ impl Mixer {
                 let Some(src) = sample_voice_frame(&v.data, pos, is_loop, src_len as usize) else {
                     continue;
                 };
-                self.acc_l[bus][i] += src * gl;
-                self.acc_r[bus][i] += src * gr;
+                add_finite(&mut self.acc_l[bus_off + i], scale_finite(src, gl));
+                add_finite(&mut self.acc_r[bus_off + i], scale_finite(src, gr));
             }
-            if end != u64::MAX && start_frame.saturating_add(n as u64) >= end {
+            if !is_loop && start_frame.saturating_add(n as u64) >= end {
                 v.active = false;
             }
         }
@@ -850,30 +964,31 @@ impl Mixer {
                 self.key_db[i] = self.key.push(self.key_l[i], self.key_r[i]);
             }
         }
-        // Fold children into parents, high-index-first, scaled by own gain.
-        for b in (0..MAX_BUSES).rev() {
+        // Fold children into parents in topological order, scaled by own gain.
+        for b in self.bus_fold_order() {
+            let off = b * MAX_BLOCK;
             if let Some(rv) = self.reverbs[b].as_mut() {
-                rv.process(&mut self.acc_l[b][..n], &mut self.acc_r[b][..n]);
+                rv.process(&mut self.acc_l[off..off + n], &mut self.acc_r[off..off + n]);
             }
             if let Some(d) = self.duckers[b].as_mut() {
                 for i in 0..n {
                     self.duck_gain[i] = d.step(self.key_db[i]);
                 }
                 for i in 0..n {
-                    self.acc_l[b][i] *= self.duck_gain[i];
-                    self.acc_r[b][i] *= self.duck_gain[i];
+                    self.acc_l[off + i] = scale_finite(self.acc_l[off + i], self.duck_gain[i]);
+                    self.acc_r[off + i] = scale_finite(self.acc_r[off + i], self.duck_gain[i]);
                 }
             }
             let (gain, parent) = (self.buses[b].gain, self.buses[b].parent);
             if b == 0 {
                 for i in 0..n {
-                    out_l[i] = self.acc_l[0][i] * gain;
-                    out_r[i] = self.acc_r[0][i] * gain;
+                    out_l[i] = scale_finite(self.acc_l[i], gain);
+                    out_r[i] = scale_finite(self.acc_r[i], gain);
                 }
                 if let Some(lim) = self.limiter.as_mut() {
                     lim.process(&mut out_l[..n], &mut out_r[..n]);
-                    self.acc_l[0][..n].copy_from_slice(&out_l[..n]);
-                    self.acc_r[0][..n].copy_from_slice(&out_r[..n]);
+                    self.acc_l[..n].copy_from_slice(&out_l[..n]);
+                    self.acc_r[..n].copy_from_slice(&out_r[..n]);
                     self.accumulate_stats(0, 1.0, n);
                 } else {
                     self.accumulate_stats(0, gain, n);
@@ -881,10 +996,8 @@ impl Mixer {
             } else if parent >= 0 {
                 self.accumulate_stats(b, gain, n);
                 let p = parent as usize;
-                for i in 0..n {
-                    self.acc_l[p][i] += self.acc_l[b][i] * gain;
-                    self.acc_r[p][i] += self.acc_r[b][i] * gain;
-                }
+                fold_bus_channel(&mut self.acc_l, b, p, n, gain);
+                fold_bus_channel(&mut self.acc_r, b, p, n, gain);
             }
             // parent == -1 on non-master: dead send, discarded.
         }
@@ -895,18 +1008,24 @@ impl Mixer {
     fn accumulate_stats(&mut self, bus: usize, gain: f32, n: usize) {
         let mut peak = self.stat_peak[bus];
         let mut sum = 0.0f64;
+        let off = bus * MAX_BLOCK;
+        let g = gain as f64;
         for i in 0..n {
-            let l = self.acc_l[bus][i] * gain;
-            let r = self.acc_r[bus][i] * gain;
-            let a = l.abs().max(r.abs());
+            let l = (self.acc_l[off + i] as f64) * g;
+            let r = (self.acc_r[off + i] as f64) * g;
+            let l = if l.is_finite() { l } else { 0.0 };
+            let r = if r.is_finite() { r } else { 0.0 };
+            let a = l.abs().max(r.abs()).min(f32::MAX as f64) as f32;
             if a > peak {
                 peak = a;
             }
-            sum += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            sum += l * l + r * r;
         }
         self.stat_peak[bus] = peak;
-        self.stat_sum_sq[bus] += sum;
-        self.block_sum_sq[bus] = sum;
+        if sum.is_finite() {
+            self.stat_sum_sq[bus] += sum;
+            self.block_sum_sq[bus] = sum;
+        }
     }
 
     fn bus_ref(&self, bus: u32) -> Result<&Bus> {

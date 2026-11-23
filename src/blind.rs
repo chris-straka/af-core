@@ -999,6 +999,11 @@ pub fn score_blind_pack(
         let agreed = choice == p.gate_choice;
 
         if p.control {
+            if !control_pair.is_empty() {
+                return Err(AfError::BadFormat(
+                    "key file contains multiple control pairs".into(),
+                ));
+            }
             control_pair = p.pair_id.clone();
             control_answer = choice.as_str().to_string();
             control_ok = choice == Side::Same;

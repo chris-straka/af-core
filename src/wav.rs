@@ -148,6 +148,9 @@ pub fn read_wav<R: Read>(mut r: R) -> Result<WavData> {
         let size_u64 = u32::from_le_bytes(chunk_hdr[4..8].try_into().unwrap()) as u64;
         let padded = size_u64 + (size_u64 & 1);
         if &chunk_hdr[0..4] == b"fmt " {
+            if fmt_seen {
+                return Err(AfError::BadFormat("duplicate fmt chunk".to_string()));
+            }
             if size_u64 < 16 {
                 return Err(AfError::BadFormat("fmt chunk < 16 bytes".to_string()));
             }
@@ -240,6 +243,9 @@ pub fn read_wav_any(bytes: &[u8]) -> Result<WavData> {
         let body = pos + 8;
         let end = body.saturating_add(size).min(bytes.len());
         if id == b"fmt " {
+            if fmt.is_some() {
+                return Err(AfError::BadFormat("duplicate fmt chunk".to_string()));
+            }
             if size < 16 || body + 16 > bytes.len() {
                 return Err(AfError::BadFormat("fmt chunk < 16 bytes".to_string()));
             }

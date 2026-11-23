@@ -52,10 +52,16 @@ fn jitter(i: usize) -> (f32, f32) {
 
 /// Segment `o + d*s`, s in [0, 1], vs an AABB. Starting inside counts.
 fn ray_hits_box(o: [f64; 3], d: [f64; 3], eps: f64, b: &Aabb) -> bool {
+    if !b.min.is_finite() || !b.max.is_finite() {
+        return false;
+    }
     let (mut tmin, mut tmax) = (0.0f64, 1.0f64);
     let mn = [b.min.x as f64, b.min.y as f64, b.min.z as f64];
     let mx = [b.max.x as f64, b.max.y as f64, b.max.z as f64];
     for a in 0..3 {
+        if mn[a] > mx[a] {
+            return false;
+        }
         if d[a].abs() < 1e-12 {
             if o[a] < mn[a] || o[a] > mx[a] {
                 return false;
@@ -98,6 +104,9 @@ fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 /// Moller-Trumbore, segment parameterized on [0, 1].
 fn ray_hits_tri(o: [f64; 3], d: [f64; 3], eps: f64, tri: &[Vec3; 3]) -> bool {
+    if !tri.iter().all(|v| v.is_finite()) {
+        return false;
+    }
     let t0 = [tri[0].x as f64, tri[0].y as f64, tri[0].z as f64];
     let t1 = [tri[1].x as f64, tri[1].y as f64, tri[1].z as f64];
     let t2 = [tri[2].x as f64, tri[2].y as f64, tri[2].z as f64];
@@ -161,7 +170,12 @@ impl OcclusionScene {
                     "occluders.tris[{i}]: vertices must be finite"
                 )));
             }
-            if (t[1] - t[0]).cross(t[2] - t[0]).length() <= 1e-9 {
+            let p0 = [t[0].x as f64, t[0].y as f64, t[0].z as f64];
+            let p1 = [t[1].x as f64, t[1].y as f64, t[1].z as f64];
+            let p2 = [t[2].x as f64, t[2].y as f64, t[2].z as f64];
+            let cr = cross3(sub3(p1, p0), sub3(p2, p0));
+            let area2 = dot3(cr, cr).sqrt();
+            if !area2.is_finite() || area2 <= 1e-9 {
                 return Err(AfError::BadArg(format!(
                     "occluders.tris[{i}]: zero-area triangle"
                 )));
@@ -170,9 +184,8 @@ impl OcclusionScene {
         Ok(())
     }
 
-    fn segment_blocked(&self, from: Vec3, to: Vec3) -> bool {
-        let o = [from.x as f64, from.y as f64, from.z as f64];
-        let d = [to.x as f64 - o[0], to.y as f64 - o[1], to.z as f64 - o[2]];
+    fn segment_blocked_f64(&self, o: [f64; 3], to: [f64; 3]) -> bool {
+        let d = [to[0] - o[0], to[1] - o[1], to[2] - o[2]];
         let dist = dot3(d, d).sqrt();
         let eps = (SEG_EPS as f64 / dist.max(1.0)).min(SEG_EPS as f64);
         self.boxes.iter().any(|b| ray_hits_box(o, d, eps, b))
@@ -190,36 +203,47 @@ impl OcclusionScene {
                 "source_radius must be finite and >= 0, got {source_radius}"
             )));
         }
-        let dx = source.x as f64 - listener.x as f64;
-        let dy = source.y as f64 - listener.y as f64;
-        let dz = source.z as f64 - listener.z as f64;
+        let o = [listener.x as f64, listener.y as f64, listener.z as f64];
+        let s = [source.x as f64, source.y as f64, source.z as f64];
+        let dx = s[0] - o[0];
+        let dy = s[1] - o[1];
+        let dz = s[2] - o[2];
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
         if dist <= 1e-9 || !dist.is_finite() || self.is_empty() {
             return Ok(0.0);
         }
         if source_radius == 0.0 {
-            return Ok(if self.segment_blocked(listener, source) {
+            return Ok(if self.segment_blocked_f64(o, s) {
                 1.0
             } else {
                 0.0
             });
         }
-        let w = Vec3::new((dx / dist) as f32, (dy / dist) as f32, (dz / dist) as f32);
-        let mut u = w.cross(Vec3::new(0.0, 1.0, 0.0));
-        if u.length() < 1e-6 {
-            u = w.cross(Vec3::new(1.0, 0.0, 0.0));
+        let w = [dx / dist, dy / dist, dz / dist];
+        let mut u = cross3(w, [0.0, 1.0, 0.0]);
+        let mut u_len = dot3(u, u).sqrt();
+        if u_len < 1e-6 {
+            u = cross3(w, [1.0, 0.0, 0.0]);
+            u_len = dot3(u, u).sqrt();
         }
-        let u = u.scale(1.0 / u.length());
-        let v = w.cross(u);
+        let u = [u[0] / u_len, u[1] / u_len, u[2] / u_len];
+        let v = cross3(w, u);
+        let rad = source_radius as f64;
         let mut blocked = 0usize;
         for i in 0..OCCLUSION_RAYS {
             let target = if i == 0 {
-                source
+                s
             } else {
                 let (ox, oy) = jitter(i);
-                source + u.scale(ox * source_radius) + v.scale(oy * source_radius)
+                let ox = ox as f64 * rad;
+                let oy = oy as f64 * rad;
+                [
+                    s[0] + u[0] * ox + v[0] * oy,
+                    s[1] + u[1] * ox + v[1] * oy,
+                    s[2] + u[2] * ox + v[2] * oy,
+                ]
             };
-            if self.segment_blocked(listener, target) {
+            if self.segment_blocked_f64(o, target) {
                 blocked += 1;
             }
         }

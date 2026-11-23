@@ -59,7 +59,7 @@ impl Scheduler {
             .position(|(f, _, _)| *f > frame)
             .unwrap_or(self.events.len());
         self.events.insert(pos, (frame, self.seq, ev));
-        self.seq += 1;
+        self.seq = self.seq.wrapping_add(1);
         Ok(())
     }
 

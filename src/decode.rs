@@ -29,11 +29,17 @@ pub fn load_audio_file(path: &Path) -> Result<DecodedAudio> {
             path.display()
         )));
     }
-    let mono = data
+    let mono: Vec<f32> = data
         .frames
         .iter()
-        .map(|f| (f.left + f.right) * 0.5)
+        .map(|f| ((f.left as f64 + f.right as f64) * 0.5) as f32)
         .collect();
+    if mono.iter().any(|s| !s.is_finite()) {
+        return Err(AfError::BadFormat(format!(
+            "{}: decoded audio contains non-finite samples",
+            path.display()
+        )));
+    }
     Ok(DecodedAudio {
         sample_rate: data.sample_rate,
         mono,
